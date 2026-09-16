@@ -6433,10 +6433,12 @@ describe("ClaudeAdapterLive", () => {
       yield* TestClock.adjust("10 millis");
       const unexpectedEvent = yield* Fiber.join(unexpectedEventFiber);
       assert.equal(unexpectedEvent._tag, "None");
-      const audit = messages.find(
+      const audits = messages.filter(
         (message): message is Record<string, unknown> =>
           typeof message === "object" && message !== null && "decision" in message,
       );
+      assert.equal(audits.length, 1);
+      const audit = audits[0];
       assert.exists(audit);
       assert.equal(audit.decision, "deny");
       assert.equal(audit.riskLevel, "critical");
@@ -6656,10 +6658,12 @@ describe("ClaudeAdapterLive", () => {
         if (result.behavior === "deny") {
           assert.equal(result.message, "User declined tool execution.");
         }
-        const audit = messages.find(
+        const audits = messages.filter(
           (message): message is Record<string, unknown> =>
             typeof message === "object" && message !== null && "decision" in message,
         );
+        assert.equal(audits.length, 1);
+        const audit = audits[0];
         assert.exists(audit);
         assert.equal(audit.decision, "ask_user");
         assert.equal(audit.requestType, "command_execution_approval");
@@ -6819,20 +6823,23 @@ describe("ClaudeAdapterLive", () => {
 
   it.effect("cancelling auto review interrupts it without opening manual approval", () => {
     let interrupted = false;
+    let reviewCount = 0;
     const messages: Array<unknown> = [];
     const logger = Logger.make<unknown, void>(({ message }) => {
       if (Array.isArray(message)) messages.push(...message);
       else messages.push(message);
     });
     const harness = makeHarness({
-      permissionReviewer: () =>
-        Effect.never.pipe(
+      permissionReviewer: () => {
+        reviewCount += 1;
+        return Effect.never.pipe(
           Effect.ensuring(
             Effect.sync(() => {
               interrupted = true;
             }),
           ),
-        ),
+        );
+      },
     });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
@@ -6846,6 +6853,25 @@ describe("ClaudeAdapterLive", () => {
       const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
       assert.equal(typeof canUseTool, "function");
       if (!canUseTool) return;
+
+      const alreadyAborted = new AbortController();
+      alreadyAborted.abort();
+      const alreadyCancelledResult = (yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command: "pwd" },
+          {
+            signal: alreadyAborted.signal,
+            requestId: "claude-request-already-cancelled",
+            toolUseID: "tool-review-already-cancelled",
+          },
+        ),
+      )) as PermissionResult;
+      assert.deepEqual(alreadyCancelledResult, {
+        behavior: "deny",
+        message: "User cancelled tool execution.",
+      });
+      assert.equal(reviewCount, 0);
 
       const abort = new AbortController();
       const permissionPromise = canUseTool(
@@ -6864,6 +6890,7 @@ describe("ClaudeAdapterLive", () => {
         behavior: "deny",
         message: "User cancelled tool execution.",
       });
+      assert.equal(reviewCount, 1);
       assert.equal(interrupted, true);
       const unexpectedEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
         Effect.timeoutOption("10 millis"),
@@ -6872,12 +6899,15 @@ describe("ClaudeAdapterLive", () => {
       yield* TestClock.adjust("10 millis");
       const unexpectedEvent = yield* Fiber.join(unexpectedEventFiber);
       assert.equal(unexpectedEvent._tag, "None");
-      const audit = messages.find(
+      const audits = messages.filter(
         (message): message is Record<string, unknown> =>
           typeof message === "object" && message !== null && "decision" in message,
       );
-      assert.exists(audit);
-      assert.equal(audit.decision, "cancelled");
+      assert.equal(audits.length, 2);
+      assert.deepEqual(
+        audits.map((audit) => audit.decision),
+        ["cancelled", "cancelled"],
+      );
     }).pipe(
       Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
       Effect.provideService(Random.Random, makeDeterministicRandomService()),

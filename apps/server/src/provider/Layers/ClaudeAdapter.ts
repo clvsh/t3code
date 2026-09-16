@@ -5021,12 +5021,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         const detail = summarizeToolRequest(toolName, toolInput);
 
         if (runtimeMode === "auto") {
-          if (callbackOptions.signal.aborted) {
-            return {
-              behavior: "deny",
-              message: "User cancelled tool execution.",
-            } satisfies PermissionResult;
-          }
           const workspacePath = input.cwd?.trim();
           const decisionReason = permissionReviewContextString(callbackOptions.decisionReason);
           const permissionTitle = permissionReviewContextString(callbackOptions.title);
@@ -5087,6 +5081,17 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
               ...details,
             });
           const reviewer = options?.permissionReviewer;
+
+          if (callbackOptions.signal.aborted) {
+            yield* logPermissionReviewCompleted({
+              decision: "cancelled",
+              reason: "Permission review was cancelled.",
+            });
+            return {
+              behavior: "deny",
+              message: "User cancelled tool execution.",
+            } satisfies PermissionResult;
+          }
 
           if (reviewRequest && reviewer) {
             const reviewOutcome = yield* Effect.raceFirst(
