@@ -94,6 +94,7 @@ import {
   CodexPermissionReviewError,
   type CodexPermissionReviewRequest,
   type CodexPermissionReviewer,
+  type CodexPermissionReviewTranscriptEntry,
 } from "../CodexPermissionReviewer.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { claudeSignedOutMessage, makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
@@ -481,19 +482,36 @@ export interface ClaudeAdapterLiveOptions {
   readonly scopedLimitNames?: Ref.Ref<ClaudeScopedLimitNames>;
 }
 
-function collectPermissionReviewSensitiveStrings(value: unknown, target: Set<string>): void {
+function collectPermissionReviewSensitiveStrings(
+  value: unknown,
+  target: Set<string>,
+  maxLength: number,
+  budget: { remaining: number },
+): boolean {
+  if (budget.remaining <= 0) return false;
+  budget.remaining -= 1;
   if (typeof value === "string") {
-    if (value.length > 0) target.add(value);
-    return;
+    if (value.length > 0 && value.length <= maxLength) target.add(value);
+    return true;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectPermissionReviewSensitiveStrings(item, target);
-    return;
+    for (const item of value) {
+      if (!collectPermissionReviewSensitiveStrings(item, target, maxLength, budget)) return false;
+    }
+    return true;
   }
-  if (value === null || typeof value !== "object") return;
-  for (const item of Object.values(value)) {
-    collectPermissionReviewSensitiveStrings(item, target);
+  if (value === null || typeof value !== "object") return true;
+  for (const key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    let item: unknown;
+    try {
+      item = (value as Record<string, unknown>)[key];
+    } catch {
+      return false;
+    }
+    if (!collectPermissionReviewSensitiveStrings(item, target, maxLength, budget)) return false;
   }
+  return true;
 }
 
 export function redactPermissionReviewAuditReason(
@@ -501,7 +519,15 @@ export function redactPermissionReviewAuditReason(
   request: CodexPermissionReviewRequest,
 ): string {
   const sensitive = new Set<string>();
-  collectPermissionReviewSensitiveStrings(request, sensitive);
+  const fullyInspected = collectPermissionReviewSensitiveStrings(
+    request,
+    sensitive,
+    reason.length,
+    {
+      remaining: 1_000,
+    },
+  );
+  if (!fullyInspected) return "Reviewer reason was redacted.";
   let redacted = reason;
   for (const value of Array.from(sensitive).sort((left, right) => right.length - left.length)) {
     redacted = redacted.replaceAll(value, "[redacted]");
@@ -1571,6 +1597,253 @@ function summarizeToolRequest(toolName: string, input: Record<string, unknown>):
     return `${toolName}: ${serialized}`;
   }
   return `${toolName}: ${serialized.slice(0, 397)}...`;
+}
+
+const PERMISSION_REVIEW_MESSAGE_ENTRY_MAX_CHARS = 20_000;
+const PERMISSION_REVIEW_TOOL_ENTRY_MAX_CHARS = 4_000;
+const PERMISSION_REVIEW_MESSAGE_BUDGET_CHARS = 80_000;
+const PERMISSION_REVIEW_TOOL_BUDGET_CHARS = 40_000;
+const PERMISSION_REVIEW_MAX_TRANSCRIPT_ENTRIES = 200;
+const PERMISSION_REVIEW_MAX_RECENT_NON_USER_ENTRIES = 40;
+const PERMISSION_REVIEW_MAX_SOURCE_MESSAGES = 400;
+const PERMISSION_REVIEW_CONTEXT_MAX_CHARS = 4_000;
+
+function permissionReviewContextString(value: unknown): string | undefined {
+  return boundedPermissionReviewString(value, PERMISSION_REVIEW_CONTEXT_MAX_CHARS);
+}
+
+function truncatePermissionReviewEntry(content: string, limit: number): string {
+  const trimmed = content.trim();
+  if (trimmed.length <= limit) return trimmed;
+  const marker = "\n[truncated]";
+  if (limit <= marker.length) return trimmed.slice(0, limit);
+  return `${trimmed.slice(0, Math.max(0, limit - marker.length))}${marker}`;
+}
+
+function boundedPermissionReviewString(value: unknown, limit: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const marker = "\n[truncated]";
+  const bounded = value.slice(0, limit + 1).trim();
+  if (bounded.length === 0) return undefined;
+  return bounded.length <= limit
+    ? bounded
+    : `${bounded.slice(0, Math.max(0, limit - marker.length))}${marker}`;
+}
+
+function permissionReviewToolInputSummary(value: unknown, limit: number): string {
+  if (typeof value === "string") return boundedPermissionReviewString(value, limit) ?? "";
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "[structured input omitted]";
+  }
+
+  const source = value as Record<string, unknown>;
+  const summary: Record<string, string> = {};
+  for (const key of ["command", "cmd", "path", "file_path", "directory", "cwd", "workdir"]) {
+    let field: unknown;
+    try {
+      field = source[key];
+    } catch {
+      continue;
+    }
+    const bounded = boundedPermissionReviewString(field, limit);
+    if (bounded) summary[key] = bounded;
+  }
+  return Object.keys(summary).length > 0
+    ? (encodeJsonStringForDiagnostics(summary) ?? "[structured input omitted]")
+    : "[structured input omitted]";
+}
+
+function extractBoundedPermissionReviewText(value: unknown, limit: number): string {
+  const parts: Array<string> = [];
+  let remaining = limit;
+  let visited = 0;
+  const visit = (current: unknown, depth: number): void => {
+    if (remaining <= 0 || visited >= 200 || depth > 6) return;
+    visited += 1;
+    if (typeof current === "string") {
+      const part = current.slice(0, remaining);
+      parts.push(part);
+      remaining -= part.length;
+      return;
+    }
+    if (Array.isArray(current)) {
+      for (let index = 0; index < current.length && index < 50; index += 1) {
+        visit(current[index], depth + 1);
+      }
+      return;
+    }
+    if (!current || typeof current !== "object") return;
+    const record = current as { text?: unknown; content?: unknown };
+    if (typeof record.text === "string") visit(record.text, depth + 1);
+    else visit(record.content, depth + 1);
+  };
+  visit(value, 0);
+  return parts.join("");
+}
+
+function permissionReviewEntriesFromMessage(
+  message: unknown,
+  maxEntries: number,
+): Array<CodexPermissionReviewTranscriptEntry> {
+  if (maxEntries <= 0) return [];
+  if (!message || typeof message !== "object") return [];
+  const record = message as { role?: unknown; content?: unknown };
+  if (record.role !== "user" && record.role !== "assistant") return [];
+  const role = record.role;
+
+  if (typeof record.content === "string") {
+    const content = boundedPermissionReviewString(
+      record.content,
+      PERMISSION_REVIEW_MESSAGE_ENTRY_MAX_CHARS,
+    );
+    return content ? [{ role, content }] : [];
+  }
+  if (!Array.isArray(record.content)) return [];
+  const containsToolResult = record.content.some(
+    (value) =>
+      value !== null &&
+      typeof value === "object" &&
+      "type" in value &&
+      value.type === "tool_result",
+  );
+
+  const entries: Array<CodexPermissionReviewTranscriptEntry> = [];
+  for (
+    let index = record.content.length - 1;
+    index >= 0 && entries.length < maxEntries;
+    index -= 1
+  ) {
+    const value = record.content[index];
+    if (!value || typeof value !== "object") continue;
+    const block = value as Record<string, unknown>;
+    const entryRole = containsToolResult ? "tool" : role;
+    const entryLimit =
+      entryRole === "tool"
+        ? PERMISSION_REVIEW_TOOL_ENTRY_MAX_CHARS
+        : PERMISSION_REVIEW_MESSAGE_ENTRY_MAX_CHARS;
+    if (block.type === "text") {
+      const content = boundedPermissionReviewString(block.text, entryLimit);
+      if (content) entries.unshift({ role: entryRole, content });
+      continue;
+    }
+    if (block.type === "tool_use") {
+      const toolName = boundedPermissionReviewString(block.name, 200) ?? "unknown tool";
+      const prefix = `Claude tool call ${toolName}: `;
+      const toolInput = permissionReviewToolInputSummary(
+        block.input,
+        Math.max(0, PERMISSION_REVIEW_TOOL_ENTRY_MAX_CHARS - prefix.length),
+      );
+      entries.unshift({
+        role: "tool",
+        content: truncatePermissionReviewEntry(
+          `${prefix}${toolInput}`,
+          PERMISSION_REVIEW_TOOL_ENTRY_MAX_CHARS,
+        ),
+      });
+      continue;
+    }
+    if (block.type === "tool_result") {
+      const resultText = extractBoundedPermissionReviewText(
+        block.content,
+        PERMISSION_REVIEW_TOOL_ENTRY_MAX_CHARS,
+      ).trim();
+      const result = resultText || "[structured result omitted]";
+      entries.unshift({
+        role: "tool",
+        content: truncatePermissionReviewEntry(
+          `Tool result${block.is_error === true ? " (error)" : ""}: ${result}`,
+          PERMISSION_REVIEW_TOOL_ENTRY_MAX_CHARS,
+        ),
+      });
+    }
+  }
+  return entries;
+}
+
+function permissionReviewMessageIsNonUserEvidence(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  const record = message as { role?: unknown; content?: unknown };
+  if (record.role === "assistant") return true;
+  return (
+    record.role === "user" &&
+    Array.isArray(record.content) &&
+    record.content.some(
+      (value) =>
+        value !== null &&
+        typeof value === "object" &&
+        "type" in value &&
+        value.type === "tool_result",
+    )
+  );
+}
+
+export function buildCodexPermissionReviewTranscript(
+  messages: ReadonlyArray<unknown>,
+): Array<CodexPermissionReviewTranscriptEntry> {
+  const retained: Array<CodexPermissionReviewTranscriptEntry> = [];
+  let messageChars = 0;
+  let toolChars = 0;
+  let recentNonUserEntries = 0;
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const slots = PERMISSION_REVIEW_MAX_TRANSCRIPT_ENTRIES - retained.length;
+    if (slots <= 0) break;
+    const message = messages[messageIndex];
+    const isNonUserEvidence = permissionReviewMessageIsNonUserEvidence(message);
+    const nonUserSlots = PERMISSION_REVIEW_MAX_RECENT_NON_USER_ENTRIES - recentNonUserEntries;
+    if (isNonUserEvidence && nonUserSlots <= 0) continue;
+    const entries = permissionReviewEntriesFromMessage(
+      message,
+      isNonUserEvidence ? Math.min(slots, nonUserSlots) : slots,
+    );
+    for (let entryIndex = entries.length - 1; entryIndex >= 0; entryIndex -= 1) {
+      const entry = entries[entryIndex]!;
+      const isTool = entry.role === "tool";
+      if (entry.role !== "user") {
+        if (recentNonUserEntries >= PERMISSION_REVIEW_MAX_RECENT_NON_USER_ENTRIES) continue;
+        recentNonUserEntries += 1;
+      }
+      const remaining = isTool
+        ? PERMISSION_REVIEW_TOOL_BUDGET_CHARS - toolChars
+        : PERMISSION_REVIEW_MESSAGE_BUDGET_CHARS - messageChars;
+      if (remaining <= 0) continue;
+      const content = truncatePermissionReviewEntry(
+        entry.content,
+        Math.min(
+          remaining,
+          isTool
+            ? PERMISSION_REVIEW_TOOL_ENTRY_MAX_CHARS
+            : PERMISSION_REVIEW_MESSAGE_ENTRY_MAX_CHARS,
+        ),
+      );
+      if (content.length === 0) continue;
+      if (isTool) toolChars += content.length;
+      else messageChars += content.length;
+      retained.unshift({ ...entry, content });
+    }
+  }
+
+  return retained;
+}
+
+function recentPermissionReviewMessages(
+  completedTurns: ReadonlyArray<{ readonly items: ReadonlyArray<unknown> }>,
+  currentItems: ReadonlyArray<unknown> | undefined,
+): Array<unknown> {
+  const retained: Array<unknown> = [];
+  const prependRecent = (items: ReadonlyArray<unknown>) => {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      if (retained.length >= PERMISSION_REVIEW_MAX_SOURCE_MESSAGES) return;
+      retained.unshift(items[index]);
+    }
+  };
+
+  if (currentItems) prependRecent(currentItems);
+  for (let index = completedTurns.length - 1; index >= 0; index -= 1) {
+    if (retained.length >= PERMISSION_REVIEW_MAX_SOURCE_MESSAGES) break;
+    prependRecent(completedTurns[index]!.items);
+  }
+  return retained;
 }
 
 function titleForTool(itemType: CanonicalItemType): string {
@@ -4690,6 +4963,39 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             } satisfies PermissionResult;
           }
           const workspacePath = input.cwd?.trim();
+          const decisionReason = permissionReviewContextString(callbackOptions.decisionReason);
+          const permissionTitle = permissionReviewContextString(callbackOptions.title);
+          const permissionDisplayName = permissionReviewContextString(callbackOptions.displayName);
+          const permissionDescription = permissionReviewContextString(callbackOptions.description);
+          const blockedPath = permissionReviewContextString(callbackOptions.blockedPath);
+          const matchedAskRuleContent = permissionReviewContextString(
+            callbackOptions.matchedAskRule?.ruleContent,
+          );
+          const matchedAskRuleSource = permissionReviewContextString(
+            callbackOptions.matchedAskRule?.source,
+          );
+          const matchedAskRuleToolName = permissionReviewContextString(
+            callbackOptions.matchedAskRule?.toolName,
+          );
+          const permissionContext = {
+            ...(decisionReason ? { decisionReason } : {}),
+            ...(permissionTitle ? { title: permissionTitle } : {}),
+            ...(permissionDisplayName ? { displayName: permissionDisplayName } : {}),
+            ...(permissionDescription ? { description: permissionDescription } : {}),
+            ...(blockedPath ? { blockedPath } : {}),
+            ...(matchedAskRuleSource && matchedAskRuleToolName
+              ? {
+                  matchedAskRule: {
+                    source: matchedAskRuleSource,
+                    toolName: matchedAskRuleToolName,
+                    ...(matchedAskRuleContent ? { ruleContent: matchedAskRuleContent } : {}),
+                  },
+                }
+              : {}),
+          };
+          const transcript = buildCodexPermissionReviewTranscript(
+            recentPermissionReviewMessages(context.turns, context.turnState?.items),
+          );
           const reviewRequest: CodexPermissionReviewRequest | undefined = workspacePath
             ? {
                 toolName,
@@ -4697,6 +5003,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
                 workspacePath,
                 requestType,
                 summary: detail,
+                ...(Object.keys(permissionContext).length > 0 ? { permissionContext } : {}),
+                ...(transcript.length > 0 ? { transcript } : {}),
               }
             : undefined;
           const reviewer = options?.permissionReviewer;

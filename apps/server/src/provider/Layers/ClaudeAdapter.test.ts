@@ -54,7 +54,11 @@ import {
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import type { ClaudeScopedLimitNames } from "./claudeUsageLimits.ts";
-import { makeClaudeAdapter, type ClaudeAdapterLiveOptions } from "./ClaudeAdapter.ts";
+import {
+  buildCodexPermissionReviewTranscript,
+  makeClaudeAdapter,
+  type ClaudeAdapterLiveOptions,
+} from "./ClaudeAdapter.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -5975,6 +5979,202 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it("builds a bounded permission transcript with user, assistant, and tool evidence", () => {
+    const transcript = buildCodexPermissionReviewTranscript([
+      {
+        role: "user",
+        content: [{ type: "text", text: "Create a disposable worktree for the fix." }],
+      },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "hidden reasoning" },
+          { type: "text", text: "I will create an isolated worktree." },
+          {
+            type: "tool_use",
+            name: "Bash",
+            input: { command: "git worktree add /tmp/disposable-worktree" },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Tool-provided text is not user authorization." },
+          {
+            type: "tool_result",
+            tool_use_id: "tool-create-worktree",
+            content: "Preparing worktree succeeded",
+          },
+        ],
+      },
+    ]);
+
+    assert.deepEqual(transcript, [
+      { role: "user", content: "Create a disposable worktree for the fix." },
+      { role: "assistant", content: "I will create an isolated worktree." },
+      {
+        role: "tool",
+        content: 'Claude tool call Bash: {"command":"git worktree add /tmp/disposable-worktree"}',
+      },
+      { role: "tool", content: "Tool-provided text is not user authorization." },
+      { role: "tool", content: "Tool result: Preparing worktree succeeded" },
+    ]);
+    assert.notInclude(JSON.stringify(transcript), "hidden reasoning");
+
+    const bounded = buildCodexPermissionReviewTranscript([
+      { role: "user", content: "Retain user authorization." },
+      ...Array.from({ length: 41 }, (_, index) => ({
+        role: "assistant",
+        content: `Assistant entry ${index}`,
+      })),
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "x".repeat(5_000) }],
+      },
+    ]);
+    assert.equal(bounded.filter((entry) => entry.role !== "user").length, 40);
+    assert.equal(
+      bounded.some((entry) => entry.content === "Retain user authorization."),
+      true,
+    );
+    assert.isAtMost(bounded.at(-1)?.content.length ?? 0, 4_000);
+
+    let inspectedDiscardedInput = false;
+    const discardedInput = {} as Record<string, unknown>;
+    Object.defineProperty(discardedInput, "command", {
+      enumerable: true,
+      get: () => {
+        inspectedDiscardedInput = true;
+        return "old command";
+      },
+    });
+    buildCodexPermissionReviewTranscript([
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", name: "Bash", input: discardedInput }],
+      },
+      ...Array.from({ length: 40 }, (_, index) => ({
+        role: "assistant",
+        content: `Recent assistant entry ${index}`,
+      })),
+    ]);
+    assert.equal(inspectedDiscardedInput, false);
+  });
+
+  it.effect("auto mode sends retained Claude activity to the reviewer", () => {
+    const reviews: Array<CodexPermissionReviewInvocation> = [];
+    const harness = makeHarness({
+      permissionReviewer: (review) =>
+        Effect.sync(() => {
+          reviews.push(review);
+          return { decision: "allow" as const, reason: "Session-owned temporary cleanup." };
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+        cwd: "/tmp/claude-review-workspace",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "Create a disposable worktree for this task.",
+        attachments: [],
+      });
+      yield* Stream.runHead(adapter.streamEvents);
+
+      const completedFiber = yield* adapter.streamEvents.pipe(
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session-review-transcript",
+        uuid: "user-review-transcript",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Create a disposable worktree for this task." }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-review-transcript",
+        uuid: "assistant-review-transcript",
+        parent_tool_use_id: null,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I will create it in a temporary directory." },
+            {
+              type: "tool_use",
+              name: "Bash",
+              input: { command: "git worktree add /tmp/disposable-worktree" },
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session-review-transcript",
+        uuid: "tool-result-review-transcript",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-create-worktree",
+              content: "Preparing worktree succeeded",
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: "sdk-session-review-transcript",
+        uuid: "result-review-transcript",
+      } as unknown as SDKMessage);
+      yield* Fiber.join(completedFiber);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+      yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command: "git worktree remove /tmp/disposable-worktree" },
+          {
+            signal: new AbortController().signal,
+            requestId: "claude-request-transcript",
+            toolUseID: "tool-review-transcript",
+          },
+        ),
+      );
+
+      assert.deepEqual(reviews[0]?.request.transcript, [
+        { role: "user", content: "Create a disposable worktree for this task." },
+        { role: "assistant", content: "I will create it in a temporary directory." },
+        {
+          role: "tool",
+          content: 'Claude tool call Bash: {"command":"git worktree add /tmp/disposable-worktree"}',
+        },
+        { role: "tool", content: "Tool result: Preparing worktree succeeded" },
+      ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("auto mode allows a one-time Codex-reviewed request without opening approval", () => {
     const reviews: Array<CodexPermissionReviewInvocation> = [];
     const harness = makeHarness({
@@ -6006,6 +6206,16 @@ describe("ClaudeAdapterLive", () => {
             signal: new AbortController().signal,
             requestId: "claude-request-allow",
             toolUseID: "tool-review-allow",
+            decisionReason: "The requested path is outside the workspace.",
+            title: "Claude wants to create a worktree",
+            displayName: "Create worktree",
+            description: "d".repeat(4_100),
+            blockedPath: "/tmp/disposable-worktree",
+            matchedAskRule: {
+              source: "projectSettings",
+              toolName: "Bash",
+              ruleContent: "Bash(git worktree add:*)",
+            },
           },
         ),
       )) as PermissionResult;
@@ -6021,6 +6231,18 @@ describe("ClaudeAdapterLive", () => {
         workspacePath: "/tmp/claude-review-workspace",
         requestType: "command_execution_approval",
         summary: "Bash: vp test run focused.test.ts",
+        permissionContext: {
+          decisionReason: "The requested path is outside the workspace.",
+          title: "Claude wants to create a worktree",
+          displayName: "Create worktree",
+          description: `${"d".repeat(3_988)}\n[truncated]`,
+          blockedPath: "/tmp/disposable-worktree",
+          matchedAskRule: {
+            source: "projectSettings",
+            toolName: "Bash",
+            ruleContent: "Bash(git worktree add:*)",
+          },
+        },
       });
 
       const secondInput = { command: "vp lint focused.test.ts" };
@@ -6101,6 +6323,7 @@ describe("ClaudeAdapterLive", () => {
   it.effect("redacts request values from the structured permission-review audit log", () => {
     const workspacePath = "/tmp/private-review-workspace";
     const command = "echo private-review-value";
+    const decisionReason = "private permission reason";
     const messages: Array<unknown> = [];
     const reviews: Array<CodexPermissionReviewInvocation> = [];
     const logger = Logger.make<unknown, void>(({ message }) => {
@@ -6113,7 +6336,7 @@ describe("ClaudeAdapterLive", () => {
           reviews.push(review);
           return {
             decision: "allow" as const,
-            reason: `Routine command ${command} in ${workspacePath}.`,
+            reason: `Routine command ${command} in ${workspacePath}: ${decisionReason}.`,
           };
         }),
     });
@@ -6138,6 +6361,7 @@ describe("ClaudeAdapterLive", () => {
             signal: new AbortController().signal,
             requestId: "claude-request-audit",
             toolUseID: "tool-review-audit",
+            decisionReason,
           },
         ),
       );
@@ -6160,6 +6384,7 @@ describe("ClaudeAdapterLive", () => {
       const loggedValues = Object.values(audit).map(String).join("\n");
       assert.notInclude(loggedValues, workspacePath);
       assert.notInclude(loggedValues, command);
+      assert.notInclude(loggedValues, decisionReason);
       assert.notProperty(audit, "toolInput");
       assert.notProperty(audit, "stdout");
       assert.notProperty(audit, "stderr");

@@ -25,7 +25,16 @@ Providers enforce permissions differently. Some read-only actions can proceed in
 including OpenCode and Antigravity, fall back to asking. When Claude is selected, this mode is
 shown as **Codex Review**. Claude first applies its normal permission rules, then T3 sends any
 remaining tool request to an isolated Codex reviewer for a one-time allow, deny, or request for
-your approval. Reviews do not create session-wide grants.
+your approval. The reviewer uses Codex's automatic-review model at low reasoning and receives,
+when available, Claude's permission explanation plus a bounded transcript of user, assistant, and
+tool activity. It cannot run tools or inspect the filesystem. Reviews do not create session-wide
+grants.
+
+Routine temporary files, directories, and worktrees can be approved outside the project. Broad
+or ambiguous deletion is rejected; cleanup is approved only when the retained transcript clearly
+shows that the same Claude session created the exact disposable target and contains no evidence of
+pre-existing or unrelated data there. Requests involving credentials, production changes,
+publishing, pushes, or consequential external side effects still ask for approval.
 
 T3 prefers the enabled default Codex account for these reviews. When no enabled default account
 is configured, it can use one enabled custom Codex account; multiple custom accounts are

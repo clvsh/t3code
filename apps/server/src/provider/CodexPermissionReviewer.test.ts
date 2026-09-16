@@ -4,7 +4,9 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
+  ProviderInstanceId,
   type ProviderInstanceConfig,
+  type ServerProvider,
   type ServerSettings,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -20,9 +22,11 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as TestClock from "effect/testing/TestClock";
 
 import { ServerSettingsService } from "../serverSettings.ts";
+import { ServerConfig } from "../config.ts";
 import {
   CodexPermissionReviewRequest,
   CodexPermissionReviewError,
+  isCodexPermissionReviewerSnapshotUsable,
   makeCodexPermissionReviewer,
   resolveCodexPermissionReviewerInstance,
 } from "./CodexPermissionReviewer.ts";
@@ -71,6 +75,18 @@ const reviewRequest: CodexPermissionReviewRequest = {
   workspacePath: "/workspaces/example",
   requestType: "command_execution_approval",
   summary: "Run a focused test",
+  permissionContext: {
+    decisionReason: "Path is outside the configured workspace.",
+    title: "Claude wants to run a command",
+    description: "The command creates a temporary worktree.",
+  },
+  transcript: [
+    { role: "user", content: "Implement this feature." },
+    {
+      role: "tool",
+      content: 'Claude tool call Bash: {"command":"git worktree add /tmp/example"}',
+    },
+  ],
 };
 
 type CapturedCommand = {
@@ -166,7 +182,15 @@ function runReview(
       { concurrency: "unbounded" },
     );
   }).pipe(
-    Effect.provide(Layer.merge(NodeServices.layer, ServerSettingsService.layerTest(settings))),
+    Effect.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3-codex-permission-review-test-",
+        }).pipe(Layer.provide(NodeServices.layer)),
+        ServerSettingsService.layerTest(settings),
+      ),
+    ),
   );
 }
 
@@ -236,6 +260,43 @@ describe("Codex permission reviewer instance resolution", () => {
       ),
     ).toBeUndefined();
   });
+
+  it("rejects known unavailable, failed, and unauthenticated snapshots", () => {
+    const instanceId = ProviderInstanceId.make("codex");
+    const snapshot = {
+      instanceId,
+      driver: CODEX_DRIVER,
+      enabled: true,
+      installed: true,
+      version: "1.0.0",
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-09-16T00:00:00.000Z",
+      models: [],
+      slashCommands: [],
+      skills: [],
+    } satisfies ServerProvider;
+
+    expect(isCodexPermissionReviewerSnapshotUsable(snapshot, instanceId)).toBe(true);
+    expect(
+      isCodexPermissionReviewerSnapshotUsable({ ...snapshot, installed: false }, instanceId),
+    ).toBe(false);
+    expect(
+      isCodexPermissionReviewerSnapshotUsable({ ...snapshot, status: "error" }, instanceId),
+    ).toBe(false);
+    expect(
+      isCodexPermissionReviewerSnapshotUsable(
+        { ...snapshot, auth: { status: "unauthenticated" } },
+        instanceId,
+      ),
+    ).toBe(false);
+    expect(
+      isCodexPermissionReviewerSnapshotUsable(
+        { ...snapshot, availability: "unavailable" },
+        instanceId,
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("Codex permission reviewer process", () => {
@@ -253,9 +314,11 @@ describe("Codex permission reviewer process", () => {
       const decodedStdin = yield* decodeReviewRequestJson(command.stdin);
       expect(decodedStdin).toEqual(reviewRequest);
       expect(command.cwdEntries).toEqual([]);
-      expect(command.args.slice(0, 7)).toEqual([
+      expect(command.args.slice(0, 9)).toEqual([
         "exec",
         "--ephemeral",
+        "--model",
+        "codex-auto-review",
         "--skip-git-repo-check",
         "--ignore-user-config",
         "--ignore-rules",
@@ -264,6 +327,17 @@ describe("Codex permission reviewer process", () => {
       ]);
       expect(command.args).toContain('web_search="disabled"');
       expect(command.args).toContain('approval_policy="never"');
+      expect(command.args).toContain('model_reasoning_effort="low"');
+      const developerInstructions = command.args.find((arg) =>
+        arg.startsWith("developer_instructions="),
+      );
+      expect(developerInstructions).toContain('Only transcript entries whose role is \\"user\\"');
+      expect(developerInstructions).toContain(
+        "Creating a specific local temporary file, directory, or git worktree is ordinarily safe",
+      );
+      expect(developerInstructions).toContain(
+        "When destructive safety cannot be established without inspecting the filesystem, DENY",
+      );
       expect(command.args.at(-1)).toBe("-");
       const expectedDisabledFeatures = [
         "apps",
@@ -294,7 +368,9 @@ describe("Codex permission reviewer process", () => {
         "tool_call_mcp_elicitation",
         "tool_suggest",
         "unified_exec",
+        "unified_exec_tty",
         "view_image",
+        "worktrees",
         "workspace_dependencies",
       ];
       expect(command.args.filter((arg) => arg === "--disable")).toHaveLength(
@@ -310,8 +386,12 @@ describe("Codex permission reviewer process", () => {
         reviewRequest.requestType,
         reviewRequest.summary,
         (reviewRequest.toolInput as { command: string }).command,
+        reviewRequest.permissionContext?.decisionReason ?? "",
+        reviewRequest.permissionContext?.description ?? "",
+        reviewRequest.transcript?.[0]?.content ?? "",
+        reviewRequest.transcript?.[1]?.content ?? "",
       ]) {
-        expect(argv).not.toContain(untrustedValue);
+        if (untrustedValue) expect(argv).not.toContain(untrustedValue);
       }
 
       const fileSystem = yield* FileSystem.FileSystem;
