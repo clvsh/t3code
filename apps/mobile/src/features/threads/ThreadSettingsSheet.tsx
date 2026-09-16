@@ -62,7 +62,7 @@ import {
   NATIVE_MAIL_SEARCH_TOOLBAR_CONTENT_INSET,
   NATIVE_MAIL_SEARCH_TOOLBAR_SUPPORTED,
 } from "../layout/native-mail-search-toolbar";
-import { RUNTIME_MODE_CHOICES, selectableChoices } from "./thread-settings-options";
+import { runtimeModeChoicesForProvider, selectableChoices } from "./thread-settings-options";
 import {
   canCommitPendingModel,
   modelMatchesCatalogQuery,
@@ -373,6 +373,7 @@ type ThreadSettingsSessionValue = {
   readonly environmentId: EnvironmentId | null;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly providerGroups: ReadonlyArray<ProviderGroup>;
+  readonly providerDriver?: string;
   readonly runtimeMode: RuntimeMode;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
   readonly displayedDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
@@ -439,6 +440,19 @@ function ThreadSettingsSessionProvider(
     () => props.providerGroups.some((group) => group.models.some((model) => model.isLegacy)),
     [props.providerGroups],
   );
+  const providerDriver = useMemo(() => {
+    if (pendingModel) return pendingModel.providerDriver;
+    const instanceId = props.selectedModel?.instanceId ?? props.providerInstanceId;
+    if (!instanceId) return undefined;
+    return props.providerGroups
+      .flatMap((group) => group.models)
+      .find((model) => model.selection.instanceId === instanceId)?.providerDriver;
+  }, [
+    pendingModel,
+    props.providerGroups,
+    props.providerInstanceId,
+    props.selectedModel?.instanceId,
+  ]);
   const commitPendingModel = useCallback(() => {
     if (pendingModel) {
       if (!canCommitPendingModel(pendingModel, props.providerGroups)) {
@@ -501,6 +515,7 @@ function ThreadSettingsSessionProvider(
       environmentId: props.environmentId,
       providerInstanceId: props.providerInstanceId,
       providerGroups: props.providerGroups,
+      providerDriver,
       runtimeMode: props.runtimeMode,
       onUpdateRuntimeMode: props.onUpdateRuntimeMode,
       displayedDescriptors,
@@ -535,6 +550,7 @@ function ThreadSettingsSessionProvider(
       providerFilter,
       props.onUpdateRuntimeMode,
       props.providerGroups,
+      providerDriver,
       props.runtimeMode,
       searchQuery,
       showLegacyToggle,
@@ -709,6 +725,7 @@ function ThreadSettingsOptionsItem(props: {
 }) {
   const insets = useSafeAreaInsets();
   const session = useThreadSettingsSession();
+  const runtimeModeChoices = runtimeModeChoicesForProvider(session.providerDriver);
   const bottomToolbarInset =
     Platform.OS === "ios" && NATIVE_MAIL_SEARCH_TOOLBAR_SUPPORTED
       ? NATIVE_MAIL_SEARCH_TOOLBAR_CONTENT_INSET
@@ -759,9 +776,7 @@ function ThreadSettingsOptionsItem(props: {
           <DisclosureRow
             isLast
             label="Runtime"
-            value={
-              RUNTIME_MODE_CHOICES.find((choice) => choice.mode === session.runtimeMode)?.label
-            }
+            value={runtimeModeChoices.find((choice) => choice.mode === session.runtimeMode)?.label}
             onPress={() => props.onOpenSubmenu({ kind: "runtime" })}
           />
         </Animated.View>
@@ -898,6 +913,7 @@ function ThreadSettingsChoiceContent(props: {
 }) {
   const insets = useSafeAreaInsets();
   const session = useThreadSettingsSession();
+  const runtimeModeChoices = runtimeModeChoicesForProvider(session.providerDriver);
   const descriptorId = props.submenu.kind === "descriptor" ? props.submenu.id : null;
 
   const activeDescriptor =
@@ -910,7 +926,7 @@ function ThreadSettingsChoiceContent(props: {
   const submenuContent =
     props.submenu.kind === "runtime"
       ? {
-          rows: RUNTIME_MODE_CHOICES.map((choice) => ({
+          rows: runtimeModeChoices.map((choice) => ({
             id: choice.mode,
             label: choice.label,
             description: choice.description,

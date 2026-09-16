@@ -30,6 +30,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Random from "effect/Random";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -39,6 +40,10 @@ import * as TestClock from "effect/testing/TestClock";
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import {
+  CodexPermissionReviewError,
+  type CodexPermissionReviewInvocation,
+} from "../CodexPermissionReviewer.ts";
 import {
   SYNTHETIC_CLAUDE_CAPABLE_MODEL,
   SYNTHETIC_CLAUDE_COLLIDING_ALIAS,
@@ -172,6 +177,7 @@ function makeHarness(config?: {
   readonly environment?: ClaudeAdapterLiveOptions["environment"];
   readonly getSessionMessages?: ClaudeAdapterLiveOptions["getSessionMessages"];
   readonly forkSession?: ClaudeAdapterLiveOptions["forkSession"];
+  readonly permissionReviewer?: ClaudeAdapterLiveOptions["permissionReviewer"];
 }) {
   const query = new FakeClaudeQuery();
   const queries = [query];
@@ -189,6 +195,7 @@ function makeHarness(config?: {
     modelCatalog: Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
     ...(config?.getSessionMessages ? { getSessionMessages: config.getSessionMessages } : {}),
     ...(config?.forkSession ? { forkSession: config.forkSession } : {}),
+    ...(config?.permissionReviewer ? { permissionReviewer: config.permissionReviewer } : {}),
     createQuery: (input) => {
       if (createInput && config?.getSessionMessages) queries.push(new FakeClaudeQuery());
       createInput = input;
@@ -461,7 +468,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("derives auto permission mode from auto runtime policy without skip flag", () => {
+  it.effect("uses Claude's default permission mode for Codex-reviewed auto policy", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
@@ -472,7 +479,7 @@ describe("ClaudeAdapterLive", () => {
       });
 
       const createInput = harness.getLastCreateQueryInput();
-      assert.equal(createInput?.options.permissionMode, "auto");
+      assert.equal(createInput?.options.permissionMode, "default");
       assert.equal(createInput?.options.allowDangerouslySkipPermissions, undefined);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -5968,6 +5975,472 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("auto mode allows a one-time Codex-reviewed request without opening approval", () => {
+    const reviews: Array<CodexPermissionReviewInvocation> = [];
+    const harness = makeHarness({
+      permissionReviewer: (review) =>
+        Effect.sync(() => {
+          reviews.push(review);
+          return { decision: "allow" as const, reason: "Routine workspace action." };
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+        cwd: "/tmp/claude-review-workspace",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const result = (yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command: "vp test run focused.test.ts", nested: { keep: true } },
+          {
+            signal: new AbortController().signal,
+            requestId: "claude-request-allow",
+            toolUseID: "tool-review-allow",
+          },
+        ),
+      )) as PermissionResult;
+
+      assert.deepEqual(result, {
+        behavior: "allow",
+        updatedInput: { command: "vp test run focused.test.ts", nested: { keep: true } },
+      });
+      assert.equal(reviews.length, 1);
+      assert.deepEqual(reviews[0]?.request, {
+        toolName: "Bash",
+        toolInput: { command: "vp test run focused.test.ts", nested: { keep: true } },
+        workspacePath: "/tmp/claude-review-workspace",
+        requestType: "command_execution_approval",
+        summary: "Bash: vp test run focused.test.ts",
+      });
+
+      const secondInput = { command: "vp lint focused.test.ts" };
+      const secondResult = (yield* Effect.promise(() =>
+        canUseTool("Bash", secondInput, {
+          signal: new AbortController().signal,
+          requestId: "claude-request-allow-second",
+          toolUseID: "tool-review-allow-second",
+        }),
+      )) as PermissionResult;
+      assert.deepEqual(secondResult, { behavior: "allow", updatedInput: secondInput });
+      assert.equal(reviews.length, 2);
+      assert.notEqual(reviews[0]?.requestId, reviews[1]?.requestId);
+
+      const unexpectedEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.timeoutOption("10 millis"),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust("10 millis");
+      const unexpectedEvent = yield* Fiber.join(unexpectedEventFiber);
+      assert.equal(unexpectedEvent._tag, "None");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("auto mode returns the Codex reviewer denial without opening approval", () => {
+    const harness = makeHarness({
+      permissionReviewer: () =>
+        Effect.succeed({
+          decision: "deny",
+          reason: "This action is unrelated to software development.",
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+        cwd: "/tmp/claude-review-workspace",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const result = (yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command: "play a game" },
+          {
+            signal: new AbortController().signal,
+            requestId: "claude-request-deny",
+            toolUseID: "tool-review-deny",
+          },
+        ),
+      )) as PermissionResult;
+      assert.deepEqual(result, {
+        behavior: "deny",
+        message: "This action is unrelated to software development.",
+      });
+      const unexpectedEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.timeoutOption("10 millis"),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust("10 millis");
+      const unexpectedEvent = yield* Fiber.join(unexpectedEventFiber);
+      assert.equal(unexpectedEvent._tag, "None");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("redacts request values from the structured permission-review audit log", () => {
+    const workspacePath = "/tmp/private-review-workspace";
+    const command = "echo private-review-value";
+    const messages: Array<unknown> = [];
+    const reviews: Array<CodexPermissionReviewInvocation> = [];
+    const logger = Logger.make<unknown, void>(({ message }) => {
+      if (Array.isArray(message)) messages.push(...message);
+      else messages.push(message);
+    });
+    const harness = makeHarness({
+      permissionReviewer: (review) =>
+        Effect.sync(() => {
+          reviews.push(review);
+          return {
+            decision: "allow" as const,
+            reason: `Routine command ${command} in ${workspacePath}.`,
+          };
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+        cwd: workspacePath,
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command },
+          {
+            signal: new AbortController().signal,
+            requestId: "claude-request-audit",
+            toolUseID: "tool-review-audit",
+          },
+        ),
+      );
+
+      const audits = messages.filter(
+        (message): message is Record<string, unknown> =>
+          typeof message === "object" &&
+          message !== null &&
+          "requestId" in message &&
+          "decision" in message &&
+          "reason" in message,
+      );
+      assert.equal(audits.length, 1);
+      const audit = audits[0];
+      assert.exists(audit);
+      assert.equal(reviews.length, 1);
+      assert.equal(audit.requestId, reviews[0]?.requestId);
+      assert.equal(audit.decision, "allow");
+      assert.match(String(audit.reason), /\[redacted\]/u);
+      const loggedValues = Object.values(audit).map(String).join("\n");
+      assert.notInclude(loggedValues, workspacePath);
+      assert.notInclude(loggedValues, command);
+      assert.notProperty(audit, "toolInput");
+      assert.notProperty(audit, "stdout");
+      assert.notProperty(audit, "stderr");
+    }).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  for (const fallback of [
+    {
+      name: "ask_user",
+      reviewer: () =>
+        Effect.succeed({ decision: "ask_user" as const, reason: "User review is required." }),
+    },
+    {
+      name: "timeout",
+      reviewer: () => Effect.fail(new CodexPermissionReviewError({ kind: "timeout" })),
+    },
+    {
+      name: "invalid output",
+      reviewer: () => Effect.fail(new CodexPermissionReviewError({ kind: "invalid" })),
+    },
+    {
+      name: "unavailable reviewer",
+      reviewer: () => Effect.fail(new CodexPermissionReviewError({ kind: "unavailable" })),
+    },
+    {
+      name: "reviewer failure",
+      reviewer: () => Effect.fail(new CodexPermissionReviewError({ kind: "failed" })),
+    },
+  ] as const) {
+    it.effect(`auto mode falls back to manual approval on ${fallback.name}`, () => {
+      const reviews: Array<CodexPermissionReviewInvocation> = [];
+      const harness = makeHarness({
+        permissionReviewer: (review) => {
+          reviews.push(review);
+          return fallback.reviewer();
+        },
+      });
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "auto",
+          cwd: "/tmp/claude-review-workspace",
+        });
+        yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+        const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+        assert.equal(typeof canUseTool, "function");
+        if (!canUseTool) return;
+
+        const permissionPromise = canUseTool(
+          "Bash",
+          { command: "git status" },
+          {
+            signal: new AbortController().signal,
+            requestId: `claude-request-${fallback.name}`,
+            toolUseID: `tool-review-${fallback.name}`,
+          },
+        );
+        const requested = yield* Stream.runHead(adapter.streamEvents);
+        assert.equal(requested._tag, "Some");
+        if (requested._tag !== "Some" || requested.value.type !== "request.opened") return;
+        assert.equal(reviews[0]?.requestId, requested.value.requestId);
+
+        yield* adapter.respondToRequest(
+          session.threadId,
+          ApprovalRequestId.make(String(requested.value.requestId)),
+          "decline",
+        );
+        yield* Stream.runHead(adapter.streamEvents);
+        const result = (yield* Effect.promise(() => permissionPromise)) as PermissionResult;
+        assert.equal(result.behavior, "deny");
+        if (result.behavior === "deny") {
+          assert.equal(result.message, "User declined tool execution.");
+        }
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    });
+  }
+
+  for (const runtimeMode of ["approval-required", "auto-accept-edits"] as const) {
+    it.effect(`${runtimeMode} never invokes the Codex reviewer`, () => {
+      let reviewCount = 0;
+      const harness = makeHarness({
+        permissionReviewer: () =>
+          Effect.sync(() => {
+            reviewCount += 1;
+            return { decision: "allow" as const, reason: "Routine action." };
+          }),
+      });
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode,
+          cwd: "/tmp/claude-review-workspace",
+        });
+        yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+        const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+        assert.equal(typeof canUseTool, "function");
+        if (!canUseTool) return;
+
+        const permissionPromise = canUseTool(
+          "Bash",
+          { command: "pwd" },
+          {
+            signal: new AbortController().signal,
+            requestId: `claude-request-${runtimeMode}`,
+            toolUseID: `tool-review-${runtimeMode}`,
+          },
+        );
+        const requested = yield* Stream.runHead(adapter.streamEvents);
+        assert.equal(requested._tag, "Some");
+        if (requested._tag !== "Some" || requested.value.type !== "request.opened") return;
+        assert.equal(reviewCount, 0);
+        yield* adapter.respondToRequest(
+          session.threadId,
+          ApprovalRequestId.make(String(requested.value.requestId)),
+          "decline",
+        );
+        yield* Stream.runHead(adapter.streamEvents);
+        yield* Effect.promise(() => permissionPromise);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    });
+  }
+
+  it.effect("auto mode falls back to manual approval when the workspace is missing", () => {
+    let reviewCount = 0;
+    const harness = makeHarness({
+      permissionReviewer: () =>
+        Effect.sync(() => {
+          reviewCount += 1;
+          return { decision: "allow" as const, reason: "Routine action." };
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const permissionPromise = canUseTool(
+        "Bash",
+        { command: "pwd" },
+        {
+          signal: new AbortController().signal,
+          requestId: "claude-request-no-workspace",
+          toolUseID: "tool-review-no-workspace",
+        },
+      );
+      const requested = yield* Stream.runHead(adapter.streamEvents);
+      assert.equal(requested._tag, "Some");
+      if (requested._tag !== "Some" || requested.value.type !== "request.opened") return;
+      assert.equal(reviewCount, 0);
+      yield* adapter.respondToRequest(
+        session.threadId,
+        ApprovalRequestId.make(String(requested.value.requestId)),
+        "decline",
+      );
+      yield* Stream.runHead(adapter.streamEvents);
+      yield* Effect.promise(() => permissionPromise);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("full access remains immediate and never invokes the Codex reviewer", () => {
+    let reviewCount = 0;
+    const harness = makeHarness({
+      permissionReviewer: () =>
+        Effect.sync(() => {
+          reviewCount += 1;
+          return { decision: "deny" as const, reason: "Do not run." };
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/claude-review-workspace",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const result = (yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command: "pwd" },
+          {
+            signal: new AbortController().signal,
+            requestId: "claude-request-full-access",
+            toolUseID: "tool-review-full-access",
+          },
+        ),
+      )) as PermissionResult;
+      assert.equal(result.behavior, "allow");
+      assert.equal(reviewCount, 0);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("cancelling auto review interrupts it without opening manual approval", () => {
+    let interrupted = false;
+    const harness = makeHarness({
+      permissionReviewer: () =>
+        Effect.never.pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              interrupted = true;
+            }),
+          ),
+        ),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+        cwd: "/tmp/claude-review-workspace",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const abort = new AbortController();
+      const permissionPromise = canUseTool(
+        "Bash",
+        { command: "pwd" },
+        {
+          signal: abort.signal,
+          requestId: "claude-request-cancel",
+          toolUseID: "tool-review-cancel",
+        },
+      );
+      yield* Effect.yieldNow;
+      abort.abort();
+      const result = (yield* Effect.promise(() => permissionPromise)) as PermissionResult;
+      assert.deepEqual(result, {
+        behavior: "deny",
+        message: "User cancelled tool execution.",
+      });
+      assert.equal(interrupted, true);
+      const unexpectedEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.timeoutOption("10 millis"),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust("10 millis");
+      const unexpectedEvent = yield* Fiber.join(unexpectedEventFiber);
+      assert.equal(unexpectedEvent._tag, "None");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("acceptForSession returns session-scoped permission updates", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -7362,14 +7835,22 @@ describe("ClaudeAdapterLive", () => {
   });
 
   it.effect("captures ExitPlanMode as a proposed plan and denies auto-exit", () => {
-    const harness = makeHarness();
+    let reviewCount = 0;
+    const harness = makeHarness({
+      permissionReviewer: () =>
+        Effect.sync(() => {
+          reviewCount += 1;
+          return { decision: "allow" as const, reason: "Routine action." };
+        }),
+    });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
 
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
-        runtimeMode: "full-access",
+        runtimeMode: "auto",
+        cwd: "/tmp/claude-review-workspace",
       });
 
       yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
@@ -7422,6 +7903,7 @@ describe("ClaudeAdapterLive", () => {
         message?: string;
       };
       assert.equal(deniedResult.message?.includes("captured your proposed plan"), true);
+      assert.equal(reviewCount, 0);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -7556,15 +8038,22 @@ describe("ClaudeAdapterLive", () => {
   });
 
   it.effect("handles AskUserQuestion via user-input.requested/resolved lifecycle", () => {
-    const harness = makeHarness();
+    let reviewCount = 0;
+    const harness = makeHarness({
+      permissionReviewer: () =>
+        Effect.sync(() => {
+          reviewCount += 1;
+          return { decision: "allow" as const, reason: "Routine action." };
+        }),
+    });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
 
-      // Start session in approval-required mode so canUseTool fires.
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
-        runtimeMode: "approval-required",
+        runtimeMode: "auto",
+        cwd: "/tmp/claude-review-workspace",
       });
 
       // Drain the session startup events (started, configured, state.changed).
@@ -7675,6 +8164,7 @@ describe("ClaudeAdapterLive", () => {
       assert.deepEqual(updatedInput.answers, { "Which framework?": "React" });
       // Original questions should be passed through.
       assert.deepEqual(updatedInput.questions, askInput.questions);
+      assert.equal(reviewCount, 0);
 
       // Compatibility check for #2388: the answers shape we hand to the SDK
       // must produce a non-empty rendered tool_result on BOTH SDK iteration

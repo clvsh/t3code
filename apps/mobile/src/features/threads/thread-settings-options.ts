@@ -36,6 +36,20 @@ export const RUNTIME_MODE_CHOICES: ReadonlyArray<{
   },
 ];
 
+const CLAUDE_RUNTIME_MODE_CHOICES = RUNTIME_MODE_CHOICES.map((choice) =>
+  choice.mode === "auto"
+    ? {
+        ...choice,
+        label: "Codex Review",
+        description: "Codex reviews one-time requests; uncertain actions still ask.",
+      }
+    : choice,
+);
+
+export function runtimeModeChoicesForProvider(providerDriver: string | undefined) {
+  return providerDriver === "claudeAgent" ? CLAUDE_RUNTIME_MODE_CHOICES : RUNTIME_MODE_CHOICES;
+}
+
 export function selectableChoices(
   descriptor: Extract<ProviderOptionDescriptor, { type: "select" }>,
 ) {

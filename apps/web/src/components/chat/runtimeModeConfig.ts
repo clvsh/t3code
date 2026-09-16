@@ -28,3 +28,16 @@ export const runtimeModeConfig: Record<
 };
 
 export const runtimeModeOptions = Object.keys(runtimeModeConfig) as RuntimeMode[];
+
+const claudeRuntimeModeConfig: typeof runtimeModeConfig = {
+  ...runtimeModeConfig,
+  auto: {
+    ...runtimeModeConfig.auto,
+    label: "Codex Review",
+    description: "Codex reviews one-time requests; uncertain actions still ask.",
+  },
+};
+
+export function runtimeModeConfigForProvider(providerDriver: string | undefined) {
+  return providerDriver === "claudeAgent" ? claudeRuntimeModeConfig : runtimeModeConfig;
+}

@@ -89,6 +89,12 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import {
+  CODEX_PERMISSION_REVIEW_REASON_MAX_CHARS,
+  CodexPermissionReviewError,
+  type CodexPermissionReviewRequest,
+  type CodexPermissionReviewer,
+} from "../CodexPermissionReviewer.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { claudeSignedOutMessage, makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import { planClaudeSkillDispatch } from "../Drivers/ClaudeSkillDispatch.ts";
@@ -470,8 +476,65 @@ export interface ClaudeAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly modelCatalog?: Effect.Effect<ClaudeModelCatalog>;
+  readonly permissionReviewer?: CodexPermissionReviewer;
   /** Scoped-bucket names the driver's status probe last saw; see `claudeUsageLimits`. */
   readonly scopedLimitNames?: Ref.Ref<ClaudeScopedLimitNames>;
+}
+
+function collectPermissionReviewSensitiveStrings(value: unknown, target: Set<string>): void {
+  if (typeof value === "string") {
+    if (value.length > 0) target.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectPermissionReviewSensitiveStrings(item, target);
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const item of Object.values(value)) {
+    collectPermissionReviewSensitiveStrings(item, target);
+  }
+}
+
+export function redactPermissionReviewAuditReason(
+  reason: string,
+  request: CodexPermissionReviewRequest,
+): string {
+  const sensitive = new Set<string>();
+  collectPermissionReviewSensitiveStrings(request, sensitive);
+  let redacted = reason;
+  for (const value of Array.from(sensitive).sort((left, right) => right.length - left.length)) {
+    redacted = redacted.replaceAll(value, "[redacted]");
+  }
+  const bounded = redacted.trim().slice(0, CODEX_PERMISSION_REVIEW_REASON_MAX_CHARS).trimEnd();
+  return bounded.length > 0 ? bounded : "Reviewer reason was fully redacted.";
+}
+
+const isCodexPermissionReviewError = Schema.is(CodexPermissionReviewError);
+
+function permissionReviewFailureReason(cause: unknown): string {
+  if (isCodexPermissionReviewError(cause)) {
+    switch (cause.kind) {
+      case "unavailable":
+        return "Codex reviewer is unavailable.";
+      case "timeout":
+        return "Codex reviewer timed out.";
+      case "invalid":
+        return "Codex reviewer returned invalid output.";
+      case "failed":
+        return "Codex reviewer failed.";
+    }
+  }
+  return "Codex reviewer failed.";
+}
+
+function awaitAbortSignal(signal: AbortSignal): Effect.Effect<"aborted"> {
+  return Effect.callback<"aborted">((resume) => {
+    const onAbort = () => resume(Effect.succeed("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    return Effect.sync(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 function isUuid(value: string): boolean {
@@ -4618,6 +4681,90 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const requestType = classifyRequestType(toolName);
         const detail = summarizeToolRequest(toolName, toolInput);
+
+        if (runtimeMode === "auto") {
+          if (callbackOptions.signal.aborted) {
+            return {
+              behavior: "deny",
+              message: "User cancelled tool execution.",
+            } satisfies PermissionResult;
+          }
+          const workspacePath = input.cwd?.trim();
+          const reviewRequest: CodexPermissionReviewRequest | undefined = workspacePath
+            ? {
+                toolName,
+                toolInput,
+                workspacePath,
+                requestType,
+                summary: detail,
+              }
+            : undefined;
+          const reviewer = options?.permissionReviewer;
+
+          if (reviewRequest && reviewer) {
+            const reviewOutcome = yield* Effect.raceFirst(
+              Effect.exit(
+                reviewer({
+                  request: reviewRequest,
+                  requestId,
+                }),
+              ).pipe(
+                Effect.map((exit) =>
+                  Exit.isSuccess(exit)
+                    ? ({ _tag: "completed" as const, result: exit.value } as const)
+                    : ({ _tag: "failed" as const, cause: Cause.squash(exit.cause) } as const),
+                ),
+              ),
+              awaitAbortSignal(callbackOptions.signal).pipe(
+                Effect.map(() => ({ _tag: "aborted" as const })),
+              ),
+            );
+
+            if (reviewOutcome._tag === "aborted") {
+              return {
+                behavior: "deny",
+                message: "User cancelled tool execution.",
+              } satisfies PermissionResult;
+            }
+
+            if (reviewOutcome._tag === "completed") {
+              const { decision, reason } = reviewOutcome.result;
+              yield* Effect.logInfo("claude.permission-review.completed", {
+                requestId,
+                decision,
+                reason: redactPermissionReviewAuditReason(reason, reviewRequest),
+              });
+
+              if (decision === "allow") {
+                return {
+                  behavior: "allow",
+                  updatedInput: toolInput,
+                } satisfies PermissionResult;
+              }
+              if (decision === "deny") {
+                return {
+                  behavior: "deny",
+                  message: reason,
+                } satisfies PermissionResult;
+              }
+            } else {
+              yield* Effect.logInfo("claude.permission-review.completed", {
+                requestId,
+                decision: "ask_user",
+                reason: permissionReviewFailureReason(reviewOutcome.cause),
+              });
+            }
+          } else {
+            yield* Effect.logInfo("claude.permission-review.completed", {
+              requestId,
+              decision: "ask_user",
+              reason: workspacePath
+                ? "Codex reviewer is unavailable."
+                : "Claude workspace is unavailable.",
+            });
+          }
+        }
+
         const decisionDeferred = yield* Deferred.make<ProviderApprovalDecision>();
         const pendingApproval: PendingApproval = {
           requestType,
@@ -4778,7 +4925,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       );
       const runtimeModeToPermission: Record<string, PermissionMode> = {
         "auto-accept-edits": "acceptEdits",
-        auto: "auto",
+        auto: "default",
         "full-access": "bypassPermissions",
       };
       // A permission launch arg is folded into the mode T3 sends rather than
