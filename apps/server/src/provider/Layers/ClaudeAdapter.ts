@@ -92,6 +92,7 @@ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   CODEX_PERMISSION_REVIEW_REASON_MAX_CHARS,
   CodexPermissionReviewError,
+  isCodexPermissionReviewDecisionConsistent,
   type CodexPermissionReviewRequest,
   type CodexPermissionReviewer,
   type CodexPermissionReviewTranscriptEntry,
@@ -1607,6 +1608,7 @@ const PERMISSION_REVIEW_MAX_TRANSCRIPT_ENTRIES = 200;
 const PERMISSION_REVIEW_MAX_RECENT_NON_USER_ENTRIES = 40;
 const PERMISSION_REVIEW_MAX_SOURCE_MESSAGES = 400;
 const PERMISSION_REVIEW_CONTEXT_MAX_CHARS = 4_000;
+const PERMISSION_REVIEW_TRUNCATION_MARKER = "\n[truncated]";
 
 function permissionReviewContextString(value: unknown): string | undefined {
   return boundedPermissionReviewString(value, PERMISSION_REVIEW_CONTEXT_MAX_CHARS);
@@ -1615,19 +1617,23 @@ function permissionReviewContextString(value: unknown): string | undefined {
 function truncatePermissionReviewEntry(content: string, limit: number): string {
   const trimmed = content.trim();
   if (trimmed.length <= limit) return trimmed;
-  const marker = "\n[truncated]";
-  if (limit <= marker.length) return trimmed.slice(0, limit);
-  return `${trimmed.slice(0, Math.max(0, limit - marker.length))}${marker}`;
+  if (limit <= PERMISSION_REVIEW_TRUNCATION_MARKER.length) return trimmed.slice(0, limit);
+  return `${trimmed.slice(
+    0,
+    Math.max(0, limit - PERMISSION_REVIEW_TRUNCATION_MARKER.length),
+  )}${PERMISSION_REVIEW_TRUNCATION_MARKER}`;
 }
 
 function boundedPermissionReviewString(value: unknown, limit: number): string | undefined {
   if (typeof value !== "string") return undefined;
-  const marker = "\n[truncated]";
   const bounded = value.slice(0, limit + 1).trim();
   if (bounded.length === 0) return undefined;
   return bounded.length <= limit
     ? bounded
-    : `${bounded.slice(0, Math.max(0, limit - marker.length))}${marker}`;
+    : `${bounded.slice(
+        0,
+        Math.max(0, limit - PERMISSION_REVIEW_TRUNCATION_MARKER.length),
+      )}${PERMISSION_REVIEW_TRUNCATION_MARKER}`;
 }
 
 function permissionReviewToolInputSummary(value: unknown, limit: number): string {
@@ -1681,6 +1687,12 @@ function extractBoundedPermissionReviewText(value: unknown, limit: number): stri
   return parts.join("");
 }
 
+function isPermissionReviewToolResult(value: unknown): boolean {
+  return (
+    value !== null && typeof value === "object" && "type" in value && value.type === "tool_result"
+  );
+}
+
 function permissionReviewEntriesFromMessage(
   message: unknown,
   maxEntries: number,
@@ -1699,13 +1711,7 @@ function permissionReviewEntriesFromMessage(
     return content ? [{ role, content }] : [];
   }
   if (!Array.isArray(record.content)) return [];
-  const containsToolResult = record.content.some(
-    (value) =>
-      value !== null &&
-      typeof value === "object" &&
-      "type" in value &&
-      value.type === "tool_result",
-  );
+  const containsToolResult = record.content.some(isPermissionReviewToolResult);
 
   const entries: Array<CodexPermissionReviewTranscriptEntry> = [];
   for (
@@ -1767,13 +1773,7 @@ function permissionReviewMessageIsNonUserEvidence(message: unknown): boolean {
   return (
     record.role === "user" &&
     Array.isArray(record.content) &&
-    record.content.some(
-      (value) =>
-        value !== null &&
-        typeof value === "object" &&
-        "type" in value &&
-        value.type === "tool_result",
-    )
+    record.content.some(isPermissionReviewToolResult)
   );
 }
 
@@ -5036,24 +5036,36 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             }
 
             if (reviewOutcome._tag === "completed") {
-              const { decision, reason } = reviewOutcome.result;
-              yield* Effect.logInfo("claude.permission-review.completed", {
-                requestId,
-                decision,
-                reason: redactPermissionReviewAuditReason(reason, reviewRequest),
-              });
+              const { decision, reason, risk_level, user_authorization } = reviewOutcome.result;
+              if (!isCodexPermissionReviewDecisionConsistent(reviewOutcome.result, reviewRequest)) {
+                yield* Effect.logInfo("claude.permission-review.completed", {
+                  requestId,
+                  decision: "ask_user",
+                  riskLevel: risk_level,
+                  userAuthorization: user_authorization,
+                  reason: "Codex reviewer returned an inconsistent assessment.",
+                });
+              } else {
+                yield* Effect.logInfo("claude.permission-review.completed", {
+                  requestId,
+                  decision,
+                  riskLevel: risk_level,
+                  userAuthorization: user_authorization,
+                  reason: redactPermissionReviewAuditReason(reason, reviewRequest),
+                });
 
-              if (decision === "allow") {
-                return {
-                  behavior: "allow",
-                  updatedInput: toolInput,
-                } satisfies PermissionResult;
-              }
-              if (decision === "deny") {
-                return {
-                  behavior: "deny",
-                  message: reason,
-                } satisfies PermissionResult;
+                if (decision === "allow") {
+                  return {
+                    behavior: "allow",
+                    updatedInput: toolInput,
+                  } satisfies PermissionResult;
+                }
+                if (decision === "deny") {
+                  return {
+                    behavior: "deny",
+                    message: reason,
+                  } satisfies PermissionResult;
+                }
               }
             } else {
               yield* Effect.logInfo("claude.permission-review.completed", {

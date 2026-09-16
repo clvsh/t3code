@@ -30,11 +30,22 @@ when available, Claude's permission explanation plus a bounded transcript of use
 tool activity. It cannot run tools or inspect the filesystem. Reviews do not create session-wide
 grants.
 
+Each review uses a two-part assessment in one isolated request: it rates the action's risk and
+separately rates how clearly your messages authorized it, then derives the decision from both.
+Low-risk actions are normally allowed. Medium- or high-risk actions can proceed when your request
+clearly authorized them. Without that authorization, potentially intentional actions ask you,
+while clearly unsafe, malicious, or unrelated actions are denied. Critical actions are denied.
+
 Routine temporary files, directories, and worktrees can be approved outside the project. Broad
 or ambiguous deletion is rejected; cleanup is approved only when the retained transcript clearly
 shows that the same Claude session created the exact disposable target and contains no evidence of
 pre-existing or unrelated data there. Requests involving credentials, production changes,
-publishing, pushes, or consequential external side effects still ask for approval.
+publishing, pushes, or consequential external side effects are judged against your authorization
+instead of being escalated solely by category, subject to absolute denials for secret exfiltration
+to an untrusted destination, broad destruction, and broad persistent security weakening. For
+example, asking Claude to create a pull request authorizes the necessary feature-branch push and
+pull-request creation, but not a force-push, direct push to the default branch, merge, release, or
+deployment.
 
 T3 prefers the enabled default Codex account for these reviews. When no enabled default account
 is configured, it can use one enabled custom Codex account; multiple custom accounts are

@@ -59,6 +59,14 @@ import {
   makeClaudeAdapter,
   type ClaudeAdapterLiveOptions,
 } from "./ClaudeAdapter.ts";
+
+const allowPermissionReview = (reason: string) => ({
+  risk_level: "low" as const,
+  user_authorization: "medium" as const,
+  decision: "allow" as const,
+  reason,
+});
+
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -6068,7 +6076,7 @@ describe("ClaudeAdapterLive", () => {
       permissionReviewer: (review) =>
         Effect.sync(() => {
           reviews.push(review);
-          return { decision: "allow" as const, reason: "Session-owned temporary cleanup." };
+          return allowPermissionReview("Session-owned temporary cleanup.");
         }),
     });
     return Effect.gen(function* () {
@@ -6181,7 +6189,7 @@ describe("ClaudeAdapterLive", () => {
       permissionReviewer: (review) =>
         Effect.sync(() => {
           reviews.push(review);
-          return { decision: "allow" as const, reason: "Routine workspace action." };
+          return allowPermissionReview("Routine workspace action.");
         }),
     });
     return Effect.gen(function* () {
@@ -6211,11 +6219,6 @@ describe("ClaudeAdapterLive", () => {
             displayName: "Create worktree",
             description: "d".repeat(4_100),
             blockedPath: "/tmp/disposable-worktree",
-            matchedAskRule: {
-              source: "projectSettings",
-              toolName: "Bash",
-              ruleContent: "Bash(git worktree add:*)",
-            },
           },
         ),
       )) as PermissionResult;
@@ -6237,11 +6240,6 @@ describe("ClaudeAdapterLive", () => {
           displayName: "Create worktree",
           description: `${"d".repeat(3_988)}\n[truncated]`,
           blockedPath: "/tmp/disposable-worktree",
-          matchedAskRule: {
-            source: "projectSettings",
-            toolName: "Bash",
-            ruleContent: "Bash(git worktree add:*)",
-          },
         },
       });
 
@@ -6270,10 +6268,72 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("auto mode preserves a matched ask rule and opens manual approval", () => {
+    const reviews: Array<CodexPermissionReviewInvocation> = [];
+    const harness = makeHarness({
+      permissionReviewer: (review) =>
+        Effect.sync(() => {
+          reviews.push(review);
+          return allowPermissionReview("Routine workspace action.");
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+        cwd: "/tmp/claude-review-workspace",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) return;
+
+      const permissionPromise = canUseTool(
+        "Bash",
+        { command: "git worktree add /tmp/disposable-worktree" },
+        {
+          signal: new AbortController().signal,
+          requestId: "claude-request-matched-rule",
+          toolUseID: "tool-review-matched-rule",
+          matchedAskRule: {
+            source: "projectSettings",
+            toolName: "Bash",
+            ruleContent: "Bash(git worktree add:*)",
+          },
+        },
+      );
+      const requested = yield* Stream.runHead(adapter.streamEvents);
+      assert.equal(requested._tag, "Some");
+      if (requested._tag !== "Some" || requested.value.type !== "request.opened") return;
+      assert.deepEqual(reviews[0]?.request.permissionContext?.matchedAskRule, {
+        source: "projectSettings",
+        toolName: "Bash",
+        ruleContent: "Bash(git worktree add:*)",
+      });
+
+      yield* adapter.respondToRequest(
+        session.threadId,
+        ApprovalRequestId.make(String(requested.value.requestId)),
+        "decline",
+      );
+      yield* Stream.runHead(adapter.streamEvents);
+      const result = (yield* Effect.promise(() => permissionPromise)) as PermissionResult;
+      assert.deepEqual(result, { behavior: "deny", message: "User declined tool execution." });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("auto mode returns the Codex reviewer denial without opening approval", () => {
     const harness = makeHarness({
       permissionReviewer: () =>
         Effect.succeed({
+          risk_level: "critical",
+          user_authorization: "unknown",
           decision: "deny",
           reason: "This action is unrelated to software development.",
         }),
@@ -6335,6 +6395,8 @@ describe("ClaudeAdapterLive", () => {
         Effect.sync(() => {
           reviews.push(review);
           return {
+            risk_level: "low" as const,
+            user_authorization: "medium" as const,
             decision: "allow" as const,
             reason: `Routine command ${command} in ${workspacePath}: ${decisionReason}.`,
           };
@@ -6380,6 +6442,8 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(reviews.length, 1);
       assert.equal(audit.requestId, reviews[0]?.requestId);
       assert.equal(audit.decision, "allow");
+      assert.equal(audit.riskLevel, "low");
+      assert.equal(audit.userAuthorization, "medium");
       assert.match(String(audit.reason), /\[redacted\]/u);
       const loggedValues = Object.values(audit).map(String).join("\n");
       assert.notInclude(loggedValues, workspacePath);
@@ -6399,7 +6463,32 @@ describe("ClaudeAdapterLive", () => {
     {
       name: "ask_user",
       reviewer: () =>
-        Effect.succeed({ decision: "ask_user" as const, reason: "User review is required." }),
+        Effect.succeed({
+          risk_level: "high" as const,
+          user_authorization: "low" as const,
+          decision: "ask_user" as const,
+          reason: "User review is required.",
+        }),
+    },
+    {
+      name: "inconsistent assessment",
+      reviewer: () =>
+        Effect.succeed({
+          risk_level: "critical" as const,
+          user_authorization: "unknown" as const,
+          decision: "allow" as const,
+          reason: "This contradictory result must not run.",
+        }),
+    },
+    {
+      name: "unauthorized medium-risk allow",
+      reviewer: () =>
+        Effect.succeed({
+          risk_level: "medium" as const,
+          user_authorization: "unknown" as const,
+          decision: "allow" as const,
+          reason: "This operation lacks user authorization.",
+        }),
     },
     {
       name: "timeout",
@@ -6479,7 +6568,7 @@ describe("ClaudeAdapterLive", () => {
         permissionReviewer: () =>
           Effect.sync(() => {
             reviewCount += 1;
-            return { decision: "allow" as const, reason: "Routine action." };
+            return allowPermissionReview("Routine action.");
           }),
       });
       return Effect.gen(function* () {
@@ -6528,7 +6617,7 @@ describe("ClaudeAdapterLive", () => {
       permissionReviewer: () =>
         Effect.sync(() => {
           reviewCount += 1;
-          return { decision: "allow" as const, reason: "Routine action." };
+          return allowPermissionReview("Routine action.");
         }),
     });
     return Effect.gen(function* () {
@@ -6575,7 +6664,12 @@ describe("ClaudeAdapterLive", () => {
       permissionReviewer: () =>
         Effect.sync(() => {
           reviewCount += 1;
-          return { decision: "deny" as const, reason: "Do not run." };
+          return {
+            risk_level: "critical" as const,
+            user_authorization: "unknown" as const,
+            decision: "deny" as const,
+            reason: "Do not run.",
+          };
         }),
     });
     return Effect.gen(function* () {
@@ -8065,7 +8159,7 @@ describe("ClaudeAdapterLive", () => {
       permissionReviewer: () =>
         Effect.sync(() => {
           reviewCount += 1;
-          return { decision: "allow" as const, reason: "Routine action." };
+          return allowPermissionReview("Routine action.");
         }),
     });
     return Effect.gen(function* () {
@@ -8268,7 +8362,7 @@ describe("ClaudeAdapterLive", () => {
       permissionReviewer: () =>
         Effect.sync(() => {
           reviewCount += 1;
-          return { decision: "allow" as const, reason: "Routine action." };
+          return allowPermissionReview("Routine action.");
         }),
     });
     return Effect.gen(function* () {

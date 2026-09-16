@@ -38,6 +38,7 @@ const decodeReviewRequestJson = Schema.decodeEffect(
 const decodeReviewRequestJsonSync = Schema.decodeSync(
   Schema.fromJsonString(CodexPermissionReviewRequest),
 );
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 function instance(
   config: unknown = {},
@@ -89,11 +90,19 @@ const reviewRequest: CodexPermissionReviewRequest = {
   ],
 };
 
+const allowReviewDecision = {
+  risk_level: "low",
+  user_authorization: "medium",
+  decision: "allow",
+  reason: "Routine workspace action.",
+} as const;
+
 type CapturedCommand = {
   readonly args: ReadonlyArray<string>;
   readonly cwd: string;
   readonly stdin: string;
   readonly cwdEntries: ReadonlyArray<string>;
+  readonly outputSchema: unknown;
 };
 
 function makeHandle(
@@ -119,8 +128,7 @@ function makeHandle(
 
 function makeReviewSpawner(
   captured: Array<CapturedCommand>,
-  response: (stdin: string) => string = () =>
-    JSON.stringify({ decision: "allow", reason: "Routine workspace action." }),
+  response: (stdin: string) => string = () => JSON.stringify(allowReviewDecision),
   exitCode: number | "never" = 0,
   onKill?: () => void,
   spawned?: Deferred.Deferred<void>,
@@ -148,7 +156,11 @@ function makeReviewSpawner(
           ),
         );
         const cwdEntries = yield* fileSystem.readDirectory(cwd);
-        captured.push({ args: command.args, cwd, stdin, cwdEntries });
+        const schemaFlag = command.args.indexOf("--output-schema");
+        const schemaPath = command.args[schemaFlag + 1];
+        if (!schemaPath) return yield* Effect.die("Missing output schema path");
+        const outputSchema = decodeUnknownJson(yield* fileSystem.readFileString(schemaPath));
+        captured.push({ args: command.args, cwd, stdin, cwdEntries, outputSchema });
         if (spawned) yield* Deferred.succeed(spawned, undefined);
         const outputFlag = command.args.indexOf("--output-last-message");
         const outputPath = command.args[outputFlag + 1];
@@ -296,6 +308,15 @@ describe("Codex permission reviewer instance resolution", () => {
         instanceId,
       ),
     ).toBe(false);
+    expect(
+      isCodexPermissionReviewerSnapshotUsable({ ...snapshot, enabled: false }, instanceId),
+    ).toBe(false);
+    expect(
+      isCodexPermissionReviewerSnapshotUsable(
+        { ...snapshot, instanceId: ProviderInstanceId.make("other") },
+        instanceId,
+      ),
+    ).toBe(false);
   });
 });
 
@@ -307,7 +328,7 @@ describe("Codex permission reviewer process", () => {
         makeReviewSpawner(captured),
         settingsWithInstances({ codex: instance({ binaryPath: "codex-review" }) }),
       );
-      expect(decision).toEqual({ decision: "allow", reason: "Routine workspace action." });
+      expect(decision).toEqual(allowReviewDecision);
       expect(captured).toHaveLength(1);
 
       const command = captured[0]!;
@@ -328,6 +349,15 @@ describe("Codex permission reviewer process", () => {
       expect(command.args).toContain('web_search="disabled"');
       expect(command.args).toContain('approval_policy="never"');
       expect(command.args).toContain('model_reasoning_effort="low"');
+      expect(command.outputSchema).toMatchObject({
+        required: ["risk_level", "user_authorization", "decision", "reason"],
+        properties: {
+          risk_level: { enum: ["low", "medium", "high", "critical"] },
+          user_authorization: { enum: ["unknown", "low", "medium", "high"] },
+          decision: { enum: ["allow", "deny", "ask_user"] },
+          reason: { type: "string" },
+        },
+      });
       const developerInstructions = command.args.find((arg) =>
         arg.startsWith("developer_instructions="),
       );
@@ -337,6 +367,12 @@ describe("Codex permission reviewer process", () => {
       );
       expect(developerInstructions).toContain(
         "When destructive safety cannot be established without inspecting the filesystem, DENY",
+      );
+      expect(developerInstructions).toContain(
+        "First assess risk_level and user_authorization independently",
+      );
+      expect(developerInstructions).toContain(
+        "When the user asked Claude to create a pull request",
       );
       expect(command.args.at(-1)).toBe("-");
       const expectedDisabledFeatures = [
@@ -410,6 +446,8 @@ describe("Codex permission reviewer process", () => {
         makeReviewSpawner(captured, (stdin) => {
           const request = decodeReviewRequestJsonSync(stdin);
           return JSON.stringify({
+            risk_level: "low",
+            user_authorization: "medium",
             decision: "allow",
             reason: request.summary === reviewRequest.summary ? "First review." : "Second review.",
           });
@@ -430,14 +468,48 @@ describe("Codex permission reviewer process", () => {
 
   for (const [name, output] of [
     ["malformed JSON", "not-json"],
-    ["unknown decision", JSON.stringify({ decision: "maybe", reason: "No." })],
-    ["empty reason", JSON.stringify({ decision: "allow", reason: "" })],
-    ["whitespace-only reason", JSON.stringify({ decision: "allow", reason: "   " })],
-    ["multiline reason", JSON.stringify({ decision: "allow", reason: "One\nTwo" })],
-    ["Unicode line separator", JSON.stringify({ decision: "allow", reason: "One\u2028Two" })],
-    ["control characters", JSON.stringify({ decision: "allow", reason: "One\u001bTwo" })],
-    ["oversized reason", JSON.stringify({ decision: "allow", reason: "x".repeat(241) })],
-    ["unexpected fields", JSON.stringify({ decision: "allow", reason: "Fine.", extra: true })],
+    ["missing risk", JSON.stringify({ decision: "allow", reason: "No." })],
+    [
+      "missing authorization",
+      JSON.stringify({ risk_level: "low", decision: "allow", reason: "No." }),
+    ],
+    ["unknown decision", JSON.stringify({ ...allowReviewDecision, decision: "maybe" })],
+    ["unknown risk", JSON.stringify({ ...allowReviewDecision, risk_level: "extreme" })],
+    [
+      "unknown authorization",
+      JSON.stringify({ ...allowReviewDecision, user_authorization: "explicit" }),
+    ],
+    [
+      "critical allow",
+      JSON.stringify({
+        ...allowReviewDecision,
+        risk_level: "critical",
+        user_authorization: "high",
+      }),
+    ],
+    [
+      "unauthorized medium-risk allow",
+      JSON.stringify({
+        ...allowReviewDecision,
+        risk_level: "medium",
+        user_authorization: "unknown",
+      }),
+    ],
+    [
+      "unauthorized high-risk allow",
+      JSON.stringify({
+        ...allowReviewDecision,
+        risk_level: "high",
+        user_authorization: "unknown",
+      }),
+    ],
+    ["empty reason", JSON.stringify({ ...allowReviewDecision, reason: "" })],
+    ["whitespace-only reason", JSON.stringify({ ...allowReviewDecision, reason: "   " })],
+    ["multiline reason", JSON.stringify({ ...allowReviewDecision, reason: "One\nTwo" })],
+    ["Unicode line separator", JSON.stringify({ ...allowReviewDecision, reason: "One\u2028Two" })],
+    ["control characters", JSON.stringify({ ...allowReviewDecision, reason: "One\u001bTwo" })],
+    ["oversized reason", JSON.stringify({ ...allowReviewDecision, reason: "x".repeat(241) })],
+    ["unexpected fields", JSON.stringify({ ...allowReviewDecision, extra: true })],
   ] as const) {
     it.effect(`rejects ${name}`, () => {
       const captured: Array<CapturedCommand> = [];
@@ -456,11 +528,32 @@ describe("Codex permission reviewer process", () => {
     return Effect.gen(function* () {
       const [decision] = yield* runReview(
         makeReviewSpawner(captured, () =>
-          JSON.stringify({ decision: "allow", reason: "x".repeat(240) }),
+          JSON.stringify({ ...allowReviewDecision, reason: "x".repeat(240) }),
         ),
         settingsWithInstances({ codex: instance() }),
       );
       expect(decision?.reason).toHaveLength(240);
+    });
+  });
+
+  it.effect("accepts an authorized narrowly scoped high-risk action", () => {
+    const captured: Array<CapturedCommand> = [];
+    return Effect.gen(function* () {
+      const [decision] = yield* runReview(
+        makeReviewSpawner(captured, () =>
+          JSON.stringify({
+            ...allowReviewDecision,
+            risk_level: "high",
+            user_authorization: "high",
+          }),
+        ),
+        settingsWithInstances({ codex: instance() }),
+      );
+      expect(decision).toMatchObject({
+        risk_level: "high",
+        user_authorization: "high",
+        decision: "allow",
+      });
     });
   });
 
