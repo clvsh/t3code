@@ -25,6 +25,12 @@ Logs are human-facing:
 
 If you want a log message to show up in the trace file, emit it inside an active span with `Effect.log...`. `Logger.tracerLogger` will attach it as a span event.
 
+Claude Codex Review attempts emit `claude.permission-review.completed`. Every attempt records safe
+input metadata such as the request type, top-level input shape, available permission context, and
+transcript role and character counts. Successful reviewer responses also include the
+decision, risk and authorization levels, and their bounded explanations. Raw commands, paths,
+prompts, tool input, transcript text, and reviewer process output are never logged.
+
 ### Traces
 
 Completed spans are written as NDJSON records to `serverTracePath`. The default depends on how the

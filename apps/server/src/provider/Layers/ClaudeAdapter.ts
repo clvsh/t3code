@@ -91,6 +91,7 @@ import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   CODEX_PERMISSION_REVIEW_REASON_MAX_CHARS,
+  CodexPermissionReviewDecision,
   CodexPermissionReviewError,
   isCodexPermissionReviewDecisionConsistent,
   type CodexPermissionReviewRequest,
@@ -537,7 +538,71 @@ export function redactPermissionReviewAuditReason(
   return bounded.length > 0 ? bounded : "Reviewer reason was fully redacted.";
 }
 
+function permissionReviewAuditInput(
+  input: Pick<
+    CodexPermissionReviewRequest,
+    "toolInput" | "requestType" | "summary" | "permissionContext" | "transcript"
+  > & { readonly workspaceAvailable: boolean },
+) {
+  const toolInputType = Array.isArray(input.toolInput)
+    ? "array"
+    : input.toolInput === null
+      ? "null"
+      : typeof input.toolInput;
+  let toolInputKeyCount: number | "unavailable" = 0;
+  let toolInputKeyCountTruncated: boolean | "unavailable" = false;
+  if (toolInputType === "object") {
+    try {
+      const keyCount = Object.keys(input.toolInput as object).length;
+      toolInputKeyCount = Math.min(keyCount, 20);
+      toolInputKeyCountTruncated = keyCount > 20;
+    } catch {
+      toolInputKeyCount = "unavailable";
+      toolInputKeyCountTruncated = "unavailable";
+    }
+  }
+
+  const permissionContextFields = [
+    input.permissionContext?.decisionReason ? "decisionReason" : undefined,
+    input.permissionContext?.title ? "title" : undefined,
+    input.permissionContext?.displayName ? "displayName" : undefined,
+    input.permissionContext?.description ? "description" : undefined,
+    input.permissionContext?.blockedPath ? "blockedPath" : undefined,
+    input.permissionContext?.matchedAskRule ? "matchedAskRule" : undefined,
+  ].filter((field): field is string => field !== undefined);
+  const transcript = input.transcript ?? [];
+  const roleCounts = { user: 0, assistant: 0, tool: 0 };
+  const roleChars = { user: 0, assistant: 0, tool: 0 };
+  for (const entry of transcript) {
+    roleCounts[entry.role] += 1;
+    roleChars[entry.role] += entry.content.length;
+  }
+
+  return {
+    requestType: input.requestType,
+    toolInputType,
+    toolInputKeyCount,
+    toolInputKeyCountTruncated,
+    summaryChars: input.summary.length,
+    workspaceAvailable: input.workspaceAvailable,
+    permissionContextFields:
+      permissionContextFields.length > 0 ? permissionContextFields.join(",") : "none",
+    matchedAskRule: input.permissionContext?.matchedAskRule !== undefined,
+    transcriptEntries: transcript.length,
+    transcriptUserEntries: roleCounts.user,
+    transcriptAssistantEntries: roleCounts.assistant,
+    transcriptToolEntries: roleCounts.tool,
+    transcriptUserChars: roleChars.user,
+    transcriptAssistantChars: roleChars.assistant,
+    transcriptToolChars: roleChars.tool,
+  };
+}
+
 const isCodexPermissionReviewError = Schema.is(CodexPermissionReviewError);
+const decodeCodexPermissionReviewDecision = Schema.decodeUnknownExit(
+  CodexPermissionReviewDecision,
+  { onExcessProperty: "error" },
+);
 
 function permissionReviewFailureReason(cause: unknown): string {
   if (isCodexPermissionReviewError(cause)) {
@@ -5007,6 +5072,20 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
                 ...(transcript.length > 0 ? { transcript } : {}),
               }
             : undefined;
+          const reviewAuditInput = permissionReviewAuditInput({
+            toolInput,
+            requestType,
+            summary: detail,
+            permissionContext,
+            transcript,
+            workspaceAvailable: workspacePath !== undefined,
+          });
+          const logPermissionReviewCompleted = (details: Record<string, unknown>) =>
+            Effect.logInfo("claude.permission-review.completed", {
+              requestId,
+              ...reviewAuditInput,
+              ...details,
+            });
           const reviewer = options?.permissionReviewer;
 
           if (reviewRequest && reviewer) {
@@ -5029,6 +5108,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             );
 
             if (reviewOutcome._tag === "aborted") {
+              yield* logPermissionReviewCompleted({
+                decision: "cancelled",
+                reason: "Permission review was cancelled.",
+              });
               return {
                 behavior: "deny",
                 message: "User cancelled tool execution.",
@@ -5036,47 +5119,70 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             }
 
             if (reviewOutcome._tag === "completed") {
-              const { decision, reason, risk_level, user_authorization } = reviewOutcome.result;
-              if (!isCodexPermissionReviewDecisionConsistent(reviewOutcome.result, reviewRequest)) {
-                yield* Effect.logInfo("claude.permission-review.completed", {
-                  requestId,
+              const decodedDecision = decodeCodexPermissionReviewDecision(reviewOutcome.result);
+              if (Exit.isFailure(decodedDecision)) {
+                yield* logPermissionReviewCompleted({
                   decision: "ask_user",
-                  riskLevel: risk_level,
-                  userAuthorization: user_authorization,
-                  reason: "Codex reviewer returned an inconsistent assessment.",
+                  reason: "Codex reviewer returned invalid output.",
                 });
               } else {
-                yield* Effect.logInfo("claude.permission-review.completed", {
-                  requestId,
+                const {
                   decision,
-                  riskLevel: risk_level,
-                  userAuthorization: user_authorization,
-                  reason: redactPermissionReviewAuditReason(reason, reviewRequest),
-                });
+                  reason,
+                  risk_level,
+                  risk_basis,
+                  user_authorization,
+                  authorization_basis,
+                } = decodedDecision.value;
+                if (
+                  !isCodexPermissionReviewDecisionConsistent(decodedDecision.value, reviewRequest)
+                ) {
+                  yield* logPermissionReviewCompleted({
+                    decision: "ask_user",
+                    riskLevel: risk_level,
+                    riskBasis: redactPermissionReviewAuditReason(risk_basis, reviewRequest),
+                    userAuthorization: user_authorization,
+                    authorizationBasis: redactPermissionReviewAuditReason(
+                      authorization_basis,
+                      reviewRequest,
+                    ),
+                    reason: "Codex reviewer returned an inconsistent assessment.",
+                  });
+                } else {
+                  yield* logPermissionReviewCompleted({
+                    decision,
+                    riskLevel: risk_level,
+                    riskBasis: redactPermissionReviewAuditReason(risk_basis, reviewRequest),
+                    userAuthorization: user_authorization,
+                    authorizationBasis: redactPermissionReviewAuditReason(
+                      authorization_basis,
+                      reviewRequest,
+                    ),
+                    reason: redactPermissionReviewAuditReason(reason, reviewRequest),
+                  });
 
-                if (decision === "allow") {
-                  return {
-                    behavior: "allow",
-                    updatedInput: toolInput,
-                  } satisfies PermissionResult;
-                }
-                if (decision === "deny") {
-                  return {
-                    behavior: "deny",
-                    message: reason,
-                  } satisfies PermissionResult;
+                  if (decision === "allow") {
+                    return {
+                      behavior: "allow",
+                      updatedInput: toolInput,
+                    } satisfies PermissionResult;
+                  }
+                  if (decision === "deny") {
+                    return {
+                      behavior: "deny",
+                      message: reason,
+                    } satisfies PermissionResult;
+                  }
                 }
               }
             } else {
-              yield* Effect.logInfo("claude.permission-review.completed", {
-                requestId,
+              yield* logPermissionReviewCompleted({
                 decision: "ask_user",
                 reason: permissionReviewFailureReason(reviewOutcome.cause),
               });
             }
           } else {
-            yield* Effect.logInfo("claude.permission-review.completed", {
-              requestId,
+            yield* logPermissionReviewCompleted({
               decision: "ask_user",
               reason: workspacePath
                 ? "Codex reviewer is unavailable."

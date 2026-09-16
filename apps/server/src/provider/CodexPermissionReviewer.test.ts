@@ -92,7 +92,9 @@ const reviewRequest: CodexPermissionReviewRequest = {
 
 const allowReviewDecision = {
   risk_level: "low",
+  risk_basis: "The action is routine and reversible.",
   user_authorization: "medium",
+  authorization_basis: "The requested outcome implies this action.",
   decision: "allow",
   reason: "Routine workspace action.",
 } as const;
@@ -350,10 +352,19 @@ describe("Codex permission reviewer process", () => {
       expect(command.args).toContain('approval_policy="never"');
       expect(command.args).toContain('model_reasoning_effort="low"');
       expect(command.outputSchema).toMatchObject({
-        required: ["risk_level", "user_authorization", "decision", "reason"],
+        required: [
+          "risk_level",
+          "risk_basis",
+          "user_authorization",
+          "authorization_basis",
+          "decision",
+          "reason",
+        ],
         properties: {
           risk_level: { enum: ["low", "medium", "high", "critical"] },
+          risk_basis: { type: "string" },
           user_authorization: { enum: ["unknown", "low", "medium", "high"] },
+          authorization_basis: { type: "string" },
           decision: { enum: ["allow", "deny", "ask_user"] },
           reason: { type: "string" },
         },
@@ -373,6 +384,15 @@ describe("Codex permission reviewer process", () => {
       );
       expect(developerInstructions).toContain(
         "When the user asked Claude to create a pull request",
+      );
+      expect(developerInstructions).toContain(
+        "risk_basis must briefly name the risk category or blast-radius factor",
+      );
+      expect(developerInstructions).toContain(
+        "authorization_basis must briefly say whether authorization came from an explicit user request",
+      );
+      expect(developerInstructions).toContain(
+        "Never quote or reproduce secrets, paths, commands, tool inputs, or other request values in risk_basis, authorization_basis, or reason",
       );
       expect(command.args.at(-1)).toBe("-");
       const expectedDisabledFeatures = [
@@ -446,9 +466,7 @@ describe("Codex permission reviewer process", () => {
         makeReviewSpawner(captured, (stdin) => {
           const request = decodeReviewRequestJsonSync(stdin);
           return JSON.stringify({
-            risk_level: "low",
-            user_authorization: "medium",
-            decision: "allow",
+            ...allowReviewDecision,
             reason: request.summary === reviewRequest.summary ? "First review." : "Second review.",
           });
         }),
@@ -471,7 +489,16 @@ describe("Codex permission reviewer process", () => {
     ["missing risk", JSON.stringify({ decision: "allow", reason: "No." })],
     [
       "missing authorization",
-      JSON.stringify({ risk_level: "low", decision: "allow", reason: "No." }),
+      JSON.stringify({
+        risk_level: "low",
+        risk_basis: "Routine action.",
+        decision: "allow",
+        reason: "No.",
+      }),
+    ],
+    [
+      "missing authorization basis",
+      JSON.stringify({ ...allowReviewDecision, authorization_basis: undefined }),
     ],
     ["unknown decision", JSON.stringify({ ...allowReviewDecision, decision: "maybe" })],
     ["unknown risk", JSON.stringify({ ...allowReviewDecision, risk_level: "extreme" })],
@@ -509,6 +536,24 @@ describe("Codex permission reviewer process", () => {
     ["Unicode line separator", JSON.stringify({ ...allowReviewDecision, reason: "One\u2028Two" })],
     ["control characters", JSON.stringify({ ...allowReviewDecision, reason: "One\u001bTwo" })],
     ["oversized reason", JSON.stringify({ ...allowReviewDecision, reason: "x".repeat(241) })],
+    ["empty risk basis", JSON.stringify({ ...allowReviewDecision, risk_basis: "" })],
+    ["multiline risk basis", JSON.stringify({ ...allowReviewDecision, risk_basis: "One\nTwo" })],
+    [
+      "oversized risk basis",
+      JSON.stringify({ ...allowReviewDecision, risk_basis: "x".repeat(241) }),
+    ],
+    [
+      "empty authorization basis",
+      JSON.stringify({ ...allowReviewDecision, authorization_basis: "" }),
+    ],
+    [
+      "multiline authorization basis",
+      JSON.stringify({ ...allowReviewDecision, authorization_basis: "One\nTwo" }),
+    ],
+    [
+      "oversized authorization basis",
+      JSON.stringify({ ...allowReviewDecision, authorization_basis: "x".repeat(241) }),
+    ],
     ["unexpected fields", JSON.stringify({ ...allowReviewDecision, extra: true })],
   ] as const) {
     it.effect(`rejects ${name}`, () => {

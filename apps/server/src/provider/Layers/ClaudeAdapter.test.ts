@@ -57,12 +57,15 @@ import type { ClaudeScopedLimitNames } from "./claudeUsageLimits.ts";
 import {
   buildCodexPermissionReviewTranscript,
   makeClaudeAdapter,
+  redactPermissionReviewAuditReason,
   type ClaudeAdapterLiveOptions,
 } from "./ClaudeAdapter.ts";
 
 const allowPermissionReview = (reason: string) => ({
   risk_level: "low" as const,
+  risk_basis: "The action is routine and reversible.",
   user_authorization: "medium" as const,
+  authorization_basis: "The requested outcome implies this action.",
   decision: "allow" as const,
   reason,
 });
@@ -6070,6 +6073,55 @@ describe("ClaudeAdapterLive", () => {
     assert.equal(inspectedDiscardedInput, false);
   });
 
+  it("redacts request values from permission-review explanations", () => {
+    const sensitiveValues = [
+      "PrivateTool",
+      "private-input-value",
+      "/private/workspace",
+      "private summary",
+      "private decision reason",
+      "private title",
+      "private display name",
+      "private description",
+      "/private/blocked-path",
+      "private rule source",
+      "private rule tool",
+      "private rule content",
+      "private user transcript",
+      "private assistant transcript",
+      "private tool transcript",
+    ];
+    const request = {
+      toolName: sensitiveValues[0]!,
+      toolInput: { value: sensitiveValues[1]! },
+      workspacePath: sensitiveValues[2]!,
+      requestType: "dynamic_tool_call" as const,
+      summary: sensitiveValues[3]!,
+      permissionContext: {
+        decisionReason: sensitiveValues[4]!,
+        title: sensitiveValues[5]!,
+        displayName: sensitiveValues[6]!,
+        description: sensitiveValues[7]!,
+        blockedPath: sensitiveValues[8]!,
+        matchedAskRule: {
+          source: sensitiveValues[9]!,
+          toolName: sensitiveValues[10]!,
+          ruleContent: sensitiveValues[11]!,
+        },
+      },
+      transcript: [
+        { role: "user" as const, content: sensitiveValues[12]! },
+        { role: "assistant" as const, content: sensitiveValues[13]! },
+        { role: "tool" as const, content: sensitiveValues[14]! },
+      ],
+    };
+    for (const sensitiveValue of sensitiveValues) {
+      const redacted = redactPermissionReviewAuditReason(`Context: ${sensitiveValue}.`, request);
+      assert.notInclude(redacted, sensitiveValue);
+      assert.include(redacted, "[redacted]");
+    }
+  });
+
   it.effect("auto mode sends retained Claude activity to the reviewer", () => {
     const reviews: Array<CodexPermissionReviewInvocation> = [];
     const harness = makeHarness({
@@ -6329,11 +6381,18 @@ describe("ClaudeAdapterLive", () => {
   });
 
   it.effect("auto mode returns the Codex reviewer denial without opening approval", () => {
+    const messages: Array<unknown> = [];
+    const logger = Logger.make<unknown, void>(({ message }) => {
+      if (Array.isArray(message)) messages.push(...message);
+      else messages.push(message);
+    });
     const harness = makeHarness({
       permissionReviewer: () =>
         Effect.succeed({
           risk_level: "critical",
+          risk_basis: "The action has an unacceptable blast radius.",
           user_authorization: "unknown",
+          authorization_basis: "No relevant user authorization was provided.",
           decision: "deny",
           reason: "This action is unrelated to software development.",
         }),
@@ -6374,7 +6433,16 @@ describe("ClaudeAdapterLive", () => {
       yield* TestClock.adjust("10 millis");
       const unexpectedEvent = yield* Fiber.join(unexpectedEventFiber);
       assert.equal(unexpectedEvent._tag, "None");
+      const audit = messages.find(
+        (message): message is Record<string, unknown> =>
+          typeof message === "object" && message !== null && "decision" in message,
+      );
+      assert.exists(audit);
+      assert.equal(audit.decision, "deny");
+      assert.equal(audit.riskLevel, "critical");
+      assert.equal(audit.userAuthorization, "unknown");
     }).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );
@@ -6396,7 +6464,9 @@ describe("ClaudeAdapterLive", () => {
           reviews.push(review);
           return {
             risk_level: "low" as const,
+            risk_basis: `Routine command ${command}.`,
             user_authorization: "medium" as const,
+            authorization_basis: `Authorized by ${decisionReason}.`,
             decision: "allow" as const,
             reason: `Routine command ${command} in ${workspacePath}: ${decisionReason}.`,
           };
@@ -6418,7 +6488,7 @@ describe("ClaudeAdapterLive", () => {
       yield* Effect.promise(() =>
         canUseTool(
           "Bash",
-          { command },
+          { command, "private-key-name": "private nested value" },
           {
             signal: new AbortController().signal,
             requestId: "claude-request-audit",
@@ -6442,13 +6512,30 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(reviews.length, 1);
       assert.equal(audit.requestId, reviews[0]?.requestId);
       assert.equal(audit.decision, "allow");
+      assert.equal(audit.requestType, "command_execution_approval");
+      assert.equal(audit.toolInputType, "object");
+      assert.equal(audit.toolInputKeyCount, 2);
+      assert.equal(audit.toolInputKeyCountTruncated, false);
+      assert.equal(audit.workspaceAvailable, true);
+      assert.equal(audit.permissionContextFields, "decisionReason");
+      assert.equal(audit.matchedAskRule, false);
+      assert.equal(audit.transcriptEntries, 0);
+      assert.equal(audit.transcriptUserEntries, 0);
+      assert.equal(audit.transcriptAssistantEntries, 0);
+      assert.equal(audit.transcriptToolEntries, 0);
       assert.equal(audit.riskLevel, "low");
+      assert.equal(audit.riskBasis, "Routine command [redacted].");
       assert.equal(audit.userAuthorization, "medium");
+      assert.equal(audit.authorizationBasis, "Authorized by [redacted].");
       assert.match(String(audit.reason), /\[redacted\]/u);
-      const loggedValues = Object.values(audit).map(String).join("\n");
+      const loggedValues = encodeUnknownJsonString(audit);
       assert.notInclude(loggedValues, workspacePath);
       assert.notInclude(loggedValues, command);
       assert.notInclude(loggedValues, decisionReason);
+      assert.notInclude(loggedValues, "private-key-name");
+      assert.notInclude(loggedValues, "private nested value");
+      assert.notProperty(audit, "toolName");
+      assert.notProperty(audit, "toolInputKeys");
       assert.notProperty(audit, "toolInput");
       assert.notProperty(audit, "stdout");
       assert.notProperty(audit, "stderr");
@@ -6465,7 +6552,9 @@ describe("ClaudeAdapterLive", () => {
       reviewer: () =>
         Effect.succeed({
           risk_level: "high" as const,
+          risk_basis: "The action has a consequential external side effect.",
           user_authorization: "low" as const,
+          authorization_basis: "The user only weakly implied this action.",
           decision: "ask_user" as const,
           reason: "User review is required.",
         }),
@@ -6475,7 +6564,9 @@ describe("ClaudeAdapterLive", () => {
       reviewer: () =>
         Effect.succeed({
           risk_level: "critical" as const,
+          risk_basis: "The action has an unacceptable blast radius.",
           user_authorization: "unknown" as const,
+          authorization_basis: "No relevant user authorization was provided.",
           decision: "allow" as const,
           reason: "This contradictory result must not run.",
         }),
@@ -6485,7 +6576,9 @@ describe("ClaudeAdapterLive", () => {
       reviewer: () =>
         Effect.succeed({
           risk_level: "medium" as const,
+          risk_basis: "The action has a bounded external side effect.",
           user_authorization: "unknown" as const,
+          authorization_basis: "No relevant user authorization was provided.",
           decision: "allow" as const,
           reason: "This operation lacks user authorization.",
         }),
@@ -6506,8 +6599,17 @@ describe("ClaudeAdapterLive", () => {
       name: "reviewer failure",
       reviewer: () => Effect.fail(new CodexPermissionReviewError({ kind: "failed" })),
     },
+    {
+      name: "malformed reviewer result",
+      reviewer: () => Effect.succeed({ decision: "allow", reason: "Incomplete." } as never),
+    },
   ] as const) {
     it.effect(`auto mode falls back to manual approval on ${fallback.name}`, () => {
+      const messages: Array<unknown> = [];
+      const logger = Logger.make<unknown, void>(({ message }) => {
+        if (Array.isArray(message)) messages.push(...message);
+        else messages.push(message);
+      });
       const reviews: Array<CodexPermissionReviewInvocation> = [];
       const harness = makeHarness({
         permissionReviewer: (review) => {
@@ -6554,7 +6656,16 @@ describe("ClaudeAdapterLive", () => {
         if (result.behavior === "deny") {
           assert.equal(result.message, "User declined tool execution.");
         }
+        const audit = messages.find(
+          (message): message is Record<string, unknown> =>
+            typeof message === "object" && message !== null && "decision" in message,
+        );
+        assert.exists(audit);
+        assert.equal(audit.decision, "ask_user");
+        assert.equal(audit.requestType, "command_execution_approval");
+        assert.equal(audit.toolInputType, "object");
       }).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
         Effect.provideService(Random.Random, makeDeterministicRandomService()),
         Effect.provide(harness.layer),
       );
@@ -6666,7 +6777,9 @@ describe("ClaudeAdapterLive", () => {
           reviewCount += 1;
           return {
             risk_level: "critical" as const,
+            risk_basis: "The action has an unacceptable blast radius.",
             user_authorization: "unknown" as const,
+            authorization_basis: "No relevant user authorization was provided.",
             decision: "deny" as const,
             reason: "Do not run.",
           };
@@ -6706,6 +6819,11 @@ describe("ClaudeAdapterLive", () => {
 
   it.effect("cancelling auto review interrupts it without opening manual approval", () => {
     let interrupted = false;
+    const messages: Array<unknown> = [];
+    const logger = Logger.make<unknown, void>(({ message }) => {
+      if (Array.isArray(message)) messages.push(...message);
+      else messages.push(message);
+    });
     const harness = makeHarness({
       permissionReviewer: () =>
         Effect.never.pipe(
@@ -6754,7 +6872,14 @@ describe("ClaudeAdapterLive", () => {
       yield* TestClock.adjust("10 millis");
       const unexpectedEvent = yield* Fiber.join(unexpectedEventFiber);
       assert.equal(unexpectedEvent._tag, "None");
+      const audit = messages.find(
+        (message): message is Record<string, unknown> =>
+          typeof message === "object" && message !== null && "decision" in message,
+      );
+      assert.exists(audit);
+      assert.equal(audit.decision, "cancelled");
     }).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );
